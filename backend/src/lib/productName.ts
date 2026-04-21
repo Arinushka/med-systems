@@ -9,6 +9,8 @@ export function normalizeText(s: string): string {
     .replace(/[“”"']/g, '')
     // Normalize dash-like characters to a space.
     .replace(/[–—-]/g, ' ')
+    // Normalize visually similar model-prefix letters before digits: Н10 ~= H10.
+    .replace(/н(?=\d)/gi, 'h')
     // Keep only letters/digits from Russian/Latin; everything else -> space.
     .replace(/[^a-z0-9а-яё]+/gi, ' ')
     .replace(/\s+/g, ' ')
@@ -144,6 +146,31 @@ function extractNameCandidates(raw: string): string[] {
   return out
 }
 
+function extractNarrativeNameCandidates(raw: string): string[] {
+  const source = (raw ?? '').toString()
+  if (!source) return []
+  const out: string[] = []
+  const seen = new Set<string>()
+  const push = (s: string) => {
+    const n = normalizeText(s)
+    if (!n || n.length < 8) return
+    if (!/(тест|полоск|анализатор|ivd|ивд|набор)/.test(n)) return
+    if (!seen.has(n)) {
+      seen.add(n)
+      out.push(n)
+    }
+  }
+
+  // Common procurement narrative pattern: "Тест-полоски ... H10 ...".
+  const rx = /(тест[^\n.;:]{0,120}полоск[^\n.;:]{0,220}(?:h|н)\s*[-]?\s*\d{1,4}[^\n.;:]*)/gi
+  for (const m of source.matchAll(rx)) push(m[1] ?? '')
+
+  // Also keep short left chunk before verbose composition/spec details.
+  const first = source.split(/[.;\n]+/g).map((x) => x.trim()).filter(Boolean)[0] ?? ''
+  if (first) push(first)
+  return out
+}
+
 /**
  * In many templates the product name is the first table column,
  * while the second column stores unit/count/service marks.
@@ -248,6 +275,22 @@ export function extractNormalizedProductNamesFromRows(
       if (!seen.has(c)) {
         seen.add(c)
         out.push(c)
+      }
+    }
+  }
+
+  if (out.length > 0) return out
+
+  // Fallback: some files keep the product title only in long narrative rows
+  // (e.g. line starts with ordinal and then "Тест-полоски ... H10 ...").
+  for (const r of rows.slice(0, 120)) {
+    const parts = [`${r.indicator ?? ''}`, `${r.valueRaw ?? ''}`]
+    for (const p of parts) {
+      for (const c of extractNarrativeNameCandidates(p)) {
+        if (!seen.has(c)) {
+          seen.add(c)
+          out.push(c)
+        }
       }
     }
   }

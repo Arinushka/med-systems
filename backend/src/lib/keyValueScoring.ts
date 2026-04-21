@@ -1,5 +1,5 @@
-import { cosineSimilarity } from '../utils/cosine'
-import { valuesMatch } from './valueCompare'
+import { cosineSimilarity } from '../utils/cosine.js'
+import { valuesMatch } from './valueCompare.js'
 
 function normalize(s: string): string {
   return (s ?? '').toLowerCase().replace(/\s+/g, ' ').trim()
@@ -31,18 +31,89 @@ function libLooksLikeKittingLine(indicator: string): boolean {
   return false
 }
 
+function looksLikeCompositionIndicator(indicator: string): boolean {
+  const s = normalize(indicator ?? '')
+  return s.includes('состав') || s.includes('комплектац') || s.includes('описан')
+}
+
+function looksLikePurposeOrDescriptionIndicator(indicator: string): boolean {
+  const s = normalize(indicator ?? '')
+  return s.includes('назначен') || s.includes('описан')
+}
+
+function looksLikeInfectionMarkersIndicator(indicator: string): boolean {
+  const s = normalize(indicator ?? '')
+  const hasCore = s.includes('выявлен') || s.includes('маркер') || s.includes('антител') || s.includes('антиген')
+  const hasDisease =
+    s.includes('вич') || s.includes('hiv') || s.includes('гепат') || s.includes('hbsag') || s.includes('сифил') || s.includes('treponema')
+  return hasCore && hasDisease
+}
+
+export function compositionLongTextFallbackMatch(queryValueRaw: string, libValueRaw: string): boolean {
+  const q = normalize(queryValueRaw ?? '')
+  const l = normalize(libValueRaw ?? '')
+  return q.length >= 80 && l.length >= 80
+}
+
+function looksLikePackQuantity(indicator: string): boolean {
+  const s = normalize(indicator ?? '')
+  if (!s.includes('колич')) return false
+  return (
+    s.includes('упаков') ||
+    s.includes('упак') ||
+    s.includes('устройств') ||
+    s.includes('набор') ||
+    s.includes('комплект')
+  )
+}
+
+function looksLikePhRangeIndicator(indicator: string): boolean {
+  const s = normalize(indicator ?? '')
+  const hasRange = s.includes('диапазон') || s.includes('предел')
+  const hasPh = s.includes('ph') || s.includes('рн')
+  const hasMeasured = s.includes('определя') || s.includes('концентрац') || s.includes('значен')
+  return hasRange && hasPh && hasMeasured
+}
+
+function looksLikePhColorScaleIndicator(indicator: string): boolean {
+  const s = normalize(indicator ?? '')
+  const hasScale = s.includes('шкал') && (s.includes('цвет') || s.includes('пол'))
+  const hasPh = s.includes('ph') || s.includes('рн')
+  return hasScale && hasPh
+}
+
+function looksLikeAnalyticalSensitivityIndicator(indicator: string): boolean {
+  const s = normalize(indicator ?? '')
+  const hasConcentration = s.includes('концентрац') || s.includes('нг мл') || s.includes('ng ml')
+  const hasSensitivity = s.includes('чувствител') || s.includes('аналитическ') || s.includes('минимальн')
+  if (hasConcentration && hasSensitivity) return true
+  // Some TЗ/PDF rows are truncated to just "концентрация, нг/мл".
+  if (hasConcentration && (s.includes('равно') || s.includes('больше') || s.includes('менее'))) return true
+  return false
+}
+
+function looksLikeResearchMaterialIndicator(indicator: string): boolean {
+  const s = normalize(indicator ?? '')
+  if (s.includes('исследуем') && s.includes('материал')) return true
+  if (s.includes('материал') && s.includes('исследован')) return true
+  if (s.includes('биологическ') && s.includes('материал')) return true
+  return false
+}
+
 export function tenderAliasesAllowValueCompare(queryIndicator: string, libIndicator: string): boolean {
-  const q = normalize(queryIndicator ?? '')
-  const l = normalize(libIndicator ?? '')
-
-  // Needle gauge can be named as "Игла" or "Размер иглы" in different templates.
-  const qNeedle = q === 'игла' || q.endsWith(' игла') || q.includes('размер иглы')
-  const lNeedle = l === 'игла' || l.endsWith(' игла') || l.includes('размер иглы')
-  if (qNeedle && lNeedle) return true
-
   return (
     (queryLooksLikeExecutableTestCount(queryIndicator) && libLooksLikeKittingLine(libIndicator)) ||
-    (queryLooksLikeExecutableTestCount(libIndicator) && libLooksLikeKittingLine(queryIndicator))
+    (queryLooksLikeExecutableTestCount(libIndicator) && libLooksLikeKittingLine(queryIndicator)) ||
+    (queryLooksLikeExecutableTestCount(queryIndicator) && looksLikePackQuantity(libIndicator)) ||
+    (queryLooksLikeExecutableTestCount(libIndicator) && looksLikePackQuantity(queryIndicator)) ||
+    (looksLikePackQuantity(queryIndicator) && looksLikePackQuantity(libIndicator)) ||
+    (looksLikePhRangeIndicator(queryIndicator) && looksLikePhRangeIndicator(libIndicator)) ||
+    (looksLikePhColorScaleIndicator(queryIndicator) && looksLikePhColorScaleIndicator(libIndicator)) ||
+    (looksLikeAnalyticalSensitivityIndicator(queryIndicator) && looksLikeAnalyticalSensitivityIndicator(libIndicator)) ||
+    (looksLikeResearchMaterialIndicator(queryIndicator) && looksLikeResearchMaterialIndicator(libIndicator)) ||
+    (looksLikeCompositionIndicator(queryIndicator) && looksLikeCompositionIndicator(libIndicator)) ||
+    (looksLikePurposeOrDescriptionIndicator(queryIndicator) && looksLikePurposeOrDescriptionIndicator(libIndicator)) ||
+    (looksLikeInfectionMarkersIndicator(queryIndicator) && looksLikeInfectionMarkersIndicator(libIndicator))
   )
 }
 
@@ -50,8 +121,9 @@ function unitTokensMatch(a: string, b: string): boolean {
   const na = normalize(a)
   const nb = normalize(b)
 
-  const aHasPercent = na.includes('%') || na.includes('percent') || na.includes('проц')
-  const bHasPercent = nb.includes('%') || nb.includes('percent') || nb.includes('проц')
+  // Avoid matching "проц" inside unrelated words like "процедурами".
+  const aHasPercent = na.includes('%') || /\bpercent\b/.test(na) || na.includes('процент')
+  const bHasPercent = nb.includes('%') || /\bpercent\b/.test(nb) || nb.includes('процент')
   if (aHasPercent || bHasPercent) return aHasPercent === bHasPercent
 
   const aHasNgMl = /ng\/?ml|нг\/?мл/.test(na)
@@ -72,6 +144,16 @@ function indicatorLooksLikeTextCriterion(indicator: string): boolean {
   const n = normalize(indicator ?? '')
   if (n.includes('выявляем') && n.includes('веществ')) return true
   if (n.includes('перечень') && n.includes('выявляем')) return true
+  if (n.includes('состав')) return true
+  if (n.includes('назначен')) return true
+  if (n.includes('комплектац')) return true
+  if (n.includes('описан')) return true
+  if ((n.includes('выявлен') || n.includes('маркер')) && (n.includes('вич') || n.includes('гепат') || n.includes('сифил'))) return true
+  if (n.includes('камера смешивания образца')) return true
+  if (looksLikeAnalyticalSensitivityIndicator(n)) return true
+  if (looksLikeResearchMaterialIndicator(n)) return true
+  if (n.includes('биологич') && n.includes('материал')) return true
+  if (n.includes('материал') && n.includes('исследован')) return true
   return false
 }
 
@@ -106,6 +188,8 @@ export function scoreKeyValueIndicators(params: {
     for (const lRow of libraryRows) {
       const s = cosineSimilarity(qRow.embedding, lRow.embedding)
       const aliasPair = tenderAliasesAllowValueCompare(qRow.indicator, lRow.indicator)
+      const compositionAliasPair =
+        looksLikeCompositionIndicator(qRow.indicator) && looksLikeCompositionIndicator(lRow.indicator)
       if (s < params.indicatorSimilarityThreshold && !aliasPair) continue
 
       if (!unitTokensMatch(qRow.valueRaw, lRow.valueRaw)) continue
@@ -117,7 +201,7 @@ export function scoreKeyValueIndicators(params: {
         toleranceAbs: params.valueToleranceAbs,
       })
 
-      if (m.match) {
+      if (m.match || (compositionAliasPair && compositionLongTextFallbackMatch(qRow.valueRaw, lRow.valueRaw))) {
         matched = true
         break
       }

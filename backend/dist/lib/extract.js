@@ -1,13 +1,20 @@
 import mammoth from 'mammoth';
 import { PDFParse } from 'pdf-parse';
 import XLSX from 'xlsx';
-import { normalizeText } from '../utils/text';
+import WordExtractor from 'word-extractor';
+import { normalizeText } from '../utils/text.js';
 export async function extractTextFromFile(params) {
     const { buffer, filename } = params;
     const lower = filename.toLowerCase();
     if (lower.endsWith('.docx')) {
         const result = await mammoth.extractRawText({ buffer });
         return normalizeText(result.value);
+    }
+    if (lower.endsWith('.doc')) {
+        const extractor = new WordExtractor();
+        const doc = await extractor.extract(buffer);
+        const body = typeof doc?.getBody === 'function' ? String(doc.getBody() ?? '') : '';
+        return normalizeText(body);
     }
     if (lower.endsWith('.pdf')) {
         const parser = new PDFParse({ data: buffer });

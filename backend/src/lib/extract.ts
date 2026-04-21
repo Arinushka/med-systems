@@ -1,8 +1,9 @@
 import mammoth from 'mammoth'
 import { PDFParse } from 'pdf-parse'
 import XLSX from 'xlsx'
+import WordExtractor from 'word-extractor'
 
-import { normalizeText } from '../utils/text'
+import { normalizeText } from '../utils/text.js'
 
 export async function extractTextFromFile(params: {
   buffer: Buffer
@@ -14,6 +15,13 @@ export async function extractTextFromFile(params: {
   if (lower.endsWith('.docx')) {
     const result = await mammoth.extractRawText({ buffer })
     return normalizeText(result.value)
+  }
+
+  if (lower.endsWith('.doc')) {
+    const extractor = new WordExtractor()
+    const doc: any = await extractor.extract(buffer as any)
+    const body = typeof doc?.getBody === 'function' ? String(doc.getBody() ?? '') : ''
+    return normalizeText(body)
   }
 
   if (lower.endsWith('.pdf')) {

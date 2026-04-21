@@ -8,20 +8,20 @@ import path from 'node:path'
 import { existsSync } from 'node:fs'
 import fs from 'node:fs/promises'
 
-import { embedTexts } from './lib/openaiEmbeddings'
-import { centroid } from './lib/centroid'
-import { cosineSimilarity } from './utils/cosine'
-import { extractRowsFromFile } from './lib/rows'
-import { loadIndex, saveIndex, type LibraryDoc } from './lib/indexStore'
-import { valuesMatch } from './lib/valueCompare'
-import { compareProductNamesWithOllama, judgeMatch, type RowForJudge, type JudgeDecision } from './lib/judge'
-import { createLibraryStorage } from './lib/storage'
+import { embedTexts } from './lib/openaiEmbeddings.js'
+import { centroid } from './lib/centroid.js'
+import { cosineSimilarity } from './utils/cosine.js'
+import { extractRowsFromFile } from './lib/rows.js'
+import { loadIndex, saveIndex, type LibraryDoc } from './lib/indexStore.js'
+import { valuesMatch } from './lib/valueCompare.js'
+import { compareProductNamesWithOllama, judgeMatch, type RowForJudge, type JudgeDecision } from './lib/judge.js'
 import {
+  compositionLongTextFallbackMatch,
   isExcludedFromParameterMatch,
   scoreKeyValueIndicators,
   tenderAliasesAllowValueCompare,
-} from './lib/keyValueScoring'
-import { extractNormalizedProductNamesFromRows } from './lib/productName'
+} from './lib/keyValueScoring.js'
+import { extractNormalizedProductNamesFromRows } from './lib/productName.js'
 
 const app = express()
 
@@ -109,6 +109,86 @@ function productNameListsContainmentMatch(a: string[], b: string[]): boolean {
   return false
 }
 
+function extractProductCodesFromText(text: string): string[] {
+  const s = (text ?? '').toString().toLowerCase()
+  const out = new Set<string>()
+  // Typical assay/catalog codes: ISYP-C41, IHIV-C41, H10-800, etc.
+  const rx = /\b[a-zа-яё]{1,8}[-_ ]?[a-zа-яё]?\d{2,5}(?:[-_ ]?\d{1,5})?\b/gi
+  for (const m of s.matchAll(rx)) {
+    const code = String(m[0] ?? '').replace(/[\s_]+/g, '-').trim()
+    if (!code) continue
+    // Skip very generic short forms like "тх-1".
+    if (code.replace(/-/g, '').length < 4) continue
+    out.add(code)
+  }
+  return [...out]
+}
+
+function extractProductCodesFromRows(rows: Array<{ indicator: string; valueRaw: string }>): string[] {
+  const out = new Set<string>()
+  for (const r of rows) {
+    for (const c of extractProductCodesFromText(`${r.indicator ?? ''} ${r.valueRaw ?? ''}`)) out.add(c)
+  }
+  return [...out]
+}
+
+function extractDiseaseMarkersFromText(text: string): string[] {
+  const s = (text ?? '').toString().toLowerCase()
+  const out = new Set<string>()
+  if (/(treponema|сифил)/i.test(s)) out.add('treponema')
+  if (/(вич|hiv)/i.test(s)) out.add('hiv')
+  if (/(hbsag|hbv|гепатит\s*в)/i.test(s)) out.add('hbv')
+  if (/(hcv|гепатит\s*с)/i.test(s)) out.add('hcv')
+  return [...out]
+}
+
+function extractDiseaseMarkersFromRows(rows: Array<{ indicator: string; valueRaw: string }>): string[] {
+  const out = new Set<string>()
+  for (const r of rows) {
+    for (const m of extractDiseaseMarkersFromText(`${r.indicator ?? ''} ${r.valueRaw ?? ''}`)) out.add(m)
+  }
+  return [...out]
+}
+
+function indicatorLooksComposition(indicator: string): boolean {
+  const s = (indicator ?? '').toLowerCase()
+  return s.includes('состав') || s.includes('комплектац') || s.includes('описан')
+}
+
+function indicatorLooksPurposeOrDescription(indicator: string): boolean {
+  const s = (indicator ?? '').toLowerCase()
+  return s.includes('назначен') || s.includes('описан')
+}
+
+function detectAnalyzerInfoFromRows(
+  rows: Array<{ indicator: string; valueRaw: string }>,
+): { hasAnalyzer: boolean; analyzers: string[] } {
+  const joined = rows
+    .map((r) => `${r.indicator ?? ''} ${r.valueRaw ?? ''}`)
+    .join(' \n ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const s = joined.toLowerCase()
+  if (!s.includes('анализатор')) return { hasAnalyzer: false, analyzers: [] }
+
+  const out = new Set<string>()
+  const rx = /(?:для|к)\s+анализатор[а-яё]*\s+([^.;,\n]{2,120})/gi
+  for (const m of joined.matchAll(rx)) {
+    const raw = String(m[1] ?? '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!raw) continue
+    // Stop at common trailing phrases.
+    const cleaned = raw
+      .replace(/\b(или|и\/или)\b.*/i, '')
+      .replace(/\b(методом|метод|ивд|in vitro)\b.*/i, '')
+      .trim()
+    if (cleaned.length >= 2) out.add(cleaned)
+  }
+
+  return { hasAnalyzer: true, analyzers: [...out] }
+}
+
 // Load environment variables for local dev.
 // We try multiple locations because backend can be started from different working directories.
 const envCandidates = [
@@ -137,7 +217,6 @@ const upload = multer({
 })
 
 const LIB_DIR = path.join(process.cwd(), 'data', 'library')
-const storage = createLibraryStorage(LIB_DIR)
 
 function restoreUtf8FromLatin1(maybeMojibake: string): string {
   // If browser sent UTF-8 bytes but headers were decoded as latin1,
@@ -171,6 +250,178 @@ app.get('/api/health', (_req, res) => {
   })
 })
 
+app.get('/api/tender-keys', async (_req, res) => {
+  try {
+    const token =
+      process.env.TENDERPLAN_API_TOKEN ??
+      'f6cf879e0113dc709cb929e4281a9f54b21a5ef6b3e4190523837650d2c1e0995ad31d17524739a5c011c7b0255e33e994daee02249d6eb4a530e22132bc2116'
+
+    const upstream = await fetch('https://tenderplan.ru/api/keys/getall', {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(15000),
+    })
+
+    const json = await upstream.json().catch(() => null)
+    if (!upstream.ok) {
+      return res.status(502).json({
+        error: `TenderPlan API error: ${upstream.status}`,
+        details: json,
+      })
+    }
+
+    const rawList = Array.isArray(json) ? json : Array.isArray((json as any)?.data) ? (json as any).data : []
+    const list = rawList
+      .filter((x: any) => typeof x?._id === 'string' && typeof x?.name === 'string')
+      .map((x: any) => ({ _id: String(x._id), name: String(x.name) }))
+
+    res.json({ ok: true, keys: list })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/tender-tenders', async (req, res) => {
+  try {
+    const keyId = String(req.query.keyId ?? req.query.key ?? req.query._id ?? '').trim()
+    if (!keyId) return res.status(400).json({ error: 'Missing keyId query param' })
+
+    const token =
+      process.env.TENDERPLAN_API_TOKEN ??
+      'f6cf879e0113dc709cb929e4281a9f54b21a5ef6b3e4190523837650d2c1e0995ad31d17524739a5c011c7b0255e33e994daee02249d6eb4a530e22132bc2116'
+
+    const url = new URL('https://tenderplan.ru/api/tenders/getlist')
+    // Pass selected key id as query param for upstream compatibility.
+    url.searchParams.set('key', keyId)
+
+    const upstream = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(20000),
+    })
+
+    const json = await upstream.json().catch(() => null)
+    if (!upstream.ok) {
+      return res.status(502).json({
+        error: `TenderPlan API error: ${upstream.status}`,
+        details: json,
+      })
+    }
+
+    const rawTenders = Array.isArray((json as any)?.tenders)
+      ? (json as any).tenders
+      : Array.isArray(json)
+        ? json
+        : []
+    const tenders = rawTenders
+      .filter((x: any) => typeof x?._id === 'string' || typeof x?.orderName === 'string')
+      .map((x: any) => ({
+        _id: String(x?._id ?? ''),
+        orderName: String(x?.orderName ?? ''),
+      }))
+
+    res.json({ ok: true, tenders })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/tender-item', async (req, res) => {
+  try {
+    const id = String(req.query.id ?? '').trim()
+    if (!id) return res.status(400).json({ error: 'Missing id query param' })
+
+    const token =
+      process.env.TENDERPLAN_API_TOKEN ??
+      'f6cf879e0113dc709cb929e4281a9f54b21a5ef6b3e4190523837650d2c1e0995ad31d17524739a5c011c7b0255e33e994daee02249d6eb4a530e22132bc2116'
+
+    const url = new URL('https://tenderplan.ru/api/tenders/get')
+    url.searchParams.set('id', id)
+
+    const upstream = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(20000),
+    })
+
+    const json = await upstream.json().catch(() => null)
+    if (!upstream.ok) {
+      return res.status(502).json({
+        error: `TenderPlan API error: ${upstream.status}`,
+        details: json,
+      })
+    }
+
+    const rawAttachments = Array.isArray((json as any)?.attachments)
+      ? (json as any).attachments
+      : Array.isArray((json as any)?.data?.attachments)
+        ? (json as any).data.attachments
+        : []
+    const maxPriceRaw = (json as any)?.maxPrice ?? (json as any)?.data?.maxPrice ?? null
+    const hrefRaw = (json as any)?.href ?? (json as any)?.data?.href ?? null
+
+    const attachments = rawAttachments
+      .filter((x: any) => typeof x?.href === 'string' || typeof x?.realName === 'string')
+      .map((x: any) => ({
+        realName: String(x?.realName ?? ''),
+        href: String(x?.href ?? ''),
+      }))
+
+    res.json({
+      ok: true,
+      href: typeof hrefRaw === 'string' ? hrefRaw : null,
+      maxPrice: typeof maxPriceRaw === 'number' ? maxPriceRaw : Number.isFinite(Number(maxPriceRaw)) ? Number(maxPriceRaw) : null,
+      attachments,
+    })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/tender-attachment', async (req, res) => {
+  try {
+    const href = String(req.query.href ?? '').trim()
+    const realName = String(req.query.realName ?? 'attachment').trim() || 'attachment'
+    if (!href) return res.status(400).json({ error: 'Missing href query param' })
+
+    const token =
+      process.env.TENDERPLAN_API_TOKEN ??
+      'f6cf879e0113dc709cb929e4281a9f54b21a5ef6b3e4190523837650d2c1e0995ad31d17524739a5c011c7b0255e33e994daee02249d6eb4a530e22132bc2116'
+
+    const downloadUrl = new URL(href, 'https://tenderplan.ru')
+    if (!/^https?:$/.test(downloadUrl.protocol)) {
+      return res.status(400).json({ error: 'Invalid href protocol' })
+    }
+
+    const upstream = await fetch(downloadUrl.toString(), {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(60000),
+    })
+
+    if (!upstream.ok) {
+      return res.status(502).json({ error: `Attachment download failed: ${upstream.status}` })
+    }
+
+    const contentType = upstream.headers.get('content-type') ?? 'application/octet-stream'
+    const data = Buffer.from(await upstream.arrayBuffer())
+
+    res.setHeader('Content-Type', contentType)
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(realName)}`)
+    res.send(data)
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    res.status(500).json({ error: message })
+  }
+})
+
 app.post('/api/library/add', upload.single('file'), async (req, res) => {
   try {
     const f = req.file
@@ -180,12 +431,14 @@ app.post('/api/library/add', upload.single('file'), async (req, res) => {
     const originalFilename = clientFilename ?? f.originalname
     const fixedFilename = restoreUtf8FromLatin1(originalFilename)
     const extension = safeExtension(fixedFilename)
-    if (!['.pdf', '.docx', '.xlsx', '.xls'].includes(extension)) {
+    if (!['.pdf', '.doc', '.docx', '.xlsx', '.xls'].includes(extension)) {
       return res.status(400).json({ error: 'Unsupported file type' })
     }
 
+    await fs.mkdir(LIB_DIR, { recursive: true })
     const id = crypto.randomUUID()
-    const storedPath = await storage.save({ id, originalFilename: fixedFilename, buffer: f.buffer })
+    const storedPath = path.join(LIB_DIR, `${id}-${fixedFilename}`)
+    await fs.writeFile(storedPath, f.buffer)
 
     const rows = await extractRowsFromFile({ buffer: f.buffer, filename: fixedFilename })
     if (rows.length === 0) {
@@ -256,8 +509,10 @@ app.delete('/api/library/:id', async (req, res) => {
     const doc = index.docs.find((d) => d.id === id)
     if (!doc) return res.status(404).json({ error: 'Document not found' })
 
-    // Remove physical file/object (best effort).
-    await storage.remove(doc.storedPath).catch(() => undefined)
+    // Remove physical file if present (best effort).
+    if (doc.storedPath && doc.storedPath.startsWith(LIB_DIR)) {
+      await fs.rm(doc.storedPath, { force: true })
+    }
 
     index.docs = index.docs.filter((d) => d.id !== id)
     await saveIndex(index)
@@ -271,7 +526,7 @@ app.delete('/api/library/:id', async (req, res) => {
 app.post('/api/library/clear', async (_req, res) => {
   try {
     const indexPath = path.join(process.cwd(), 'data', 'library-index.json')
-    await storage.clearAll()
+    await fs.rm(LIB_DIR, { recursive: true, force: true })
     await fs.rm(indexPath, { force: true })
     res.json({ ok: true })
   } catch (e) {
@@ -282,9 +537,12 @@ app.post('/api/library/clear', async (_req, res) => {
 
 app.post('/api/library/reindexStored', async (_req, res) => {
   try {
-    const supported = new Set(['.pdf', '.docx', '.xlsx', '.xls'])
-    const storageFiles = await storage.list()
-    const libraryFiles = storageFiles.filter((x) => supported.has(path.extname(x.name).toLowerCase()))
+    await fs.mkdir(LIB_DIR, { recursive: true })
+    const allFiles = await fs.readdir(LIB_DIR)
+    const supported = new Set(['.pdf', '.doc', '.docx', '.xlsx', '.xls'])
+    const libraryFiles = allFiles
+      .map((name) => path.join(LIB_DIR, name))
+      .filter((p) => supported.has(path.extname(p).toLowerCase()))
 
     // Clear existing index; keep physical files.
     const indexPath = path.join(process.cwd(), 'data', 'library-index.json')
@@ -292,9 +550,8 @@ app.post('/api/library/reindexStored', async (_req, res) => {
 
     const docs: LibraryDoc[] = []
 
-    for (const file of libraryFiles) {
-      const storedPath = file.storedPath
-      const name = file.name
+    for (const storedPath of libraryFiles) {
+      const name = path.basename(storedPath)
       // Try to parse stored format: <uuid>-<originalFilename>
       const m = name.match(/^([0-9a-fA-F-]{36})-(.+)$/)
       const id = m?.[1] ?? crypto.randomUUID()
@@ -302,7 +559,7 @@ app.post('/api/library/reindexStored', async (_req, res) => {
       const fixedFilename = restoreUtf8FromLatin1(originalFilenameRaw)
       const extension = safeExtension(fixedFilename)
 
-      const buffer = await storage.read(storedPath)
+      const buffer = await fs.readFile(storedPath)
       const rows = await extractRowsFromFile({ buffer, filename: fixedFilename })
       if (rows.length === 0) continue
 
@@ -347,7 +604,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     const originalFilename = clientFilename ?? f.originalname
     const fixedFilename = restoreUtf8FromLatin1(originalFilename)
     const extension = safeExtension(fixedFilename)
-    if (!['.pdf', '.docx', '.xlsx', '.xls'].includes(extension)) {
+    if (!['.pdf', '.doc', '.docx', '.xlsx', '.xls'].includes(extension)) {
       return res.status(400).json({ error: 'Unsupported file type' })
     }
 
@@ -360,10 +617,15 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     if (queryRows.length === 0) {
       return res.status(400).json({ error: 'No rows detected in uploaded file (indicator/value)' })
     }
+    const analyzerInfo = detectAnalyzerInfoFromRows(queryRows as any)
 
     // First gate: product name must match between query file and library document (any of several parsed titles).
     const queryProductNames = extractNormalizedProductNamesFromRows(queryRows as any)
+    const queryCodes = extractProductCodesFromRows(queryRows as any)
+    const queryMarkers = extractDiseaseMarkersFromRows(queryRows as any)
     const queryFileHint = productNameHintFromFilename(fixedFilename)
+    for (const c of extractProductCodesFromText(fixedFilename)) queryCodes.push(c)
+    for (const m of extractDiseaseMarkersFromText(fixedFilename)) queryMarkers.push(m)
     const queryNamesForGate = [...queryProductNames]
     if (queryFileHint && !queryNamesForGate.includes(queryFileHint)) queryNamesForGate.push(queryFileHint)
 
@@ -374,7 +636,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
 
     const indicatorSimilarityThreshold = Number(process.env.MATCH_INDICATOR_SIM_THRESHOLD ?? 0.75)
     const passThresholdPercent = Number(process.env.MATCH_PASS_PERCENT ?? 82)
-    const minCriteriaIfNameMatched = Number(process.env.MATCH_MIN_CRITERIA_IF_NAME_MATCH ?? 2)
+    const minCriteriaIfNameMatched = Number(process.env.MATCH_MIN_CRITERIA_IF_NAME_MATCH ?? 1)
     const maxCandidateDocs = Number(process.env.MATCH_CANDIDATE_DOCS ?? 8)
     const maxKeyRows = Number(process.env.MATCH_KEYVALUE_MAX_QUERY_ROWS ?? 40)
     const maxLibraryRows = Number(process.env.MATCH_KEYVALUE_MAX_LIBRARY_ROWS ?? 300)
@@ -417,12 +679,18 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
 
     const libDocNames = candidateDocs.map((doc) => {
       const names = extractNormalizedProductNamesFromRows((doc.rows as any) ?? [])
+      const codes = extractProductCodesFromRows((doc.rows as any) ?? [])
+      const markers = extractDiseaseMarkersFromRows((doc.rows as any) ?? [])
       const fileHint = productNameHintFromFilename(doc.originalFilename)
       const namesForGate = [...names]
       if (fileHint && !namesForGate.includes(fileHint)) namesForGate.push(fileHint)
+      for (const c of extractProductCodesFromText(doc.originalFilename)) codes.push(c)
+      for (const m of extractDiseaseMarkersFromText(doc.originalFilename)) markers.push(m)
       return {
       doc,
       names,
+      codes: [...new Set(codes)],
+      markers: [...new Set(markers)],
       fileHint,
       namesForGate,
     }})
@@ -441,7 +709,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
 
     const queryNameSet = new Set(queryNamesForGate)
     let gatedWithNameDiagnostics = libDocNames
-      .map(({ doc, names, fileHint, namesForGate }) => {
+      .map(({ doc, names, codes, markers, fileHint, namesForGate }) => {
         if (namesForGate.length === 0) {
           return {
             doc,
@@ -454,7 +722,18 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
           }
         }
 
+        const queryCodeSet = new Set(queryCodes)
+        const queryMarkerSet = new Set(queryMarkers)
+        const codeMatch = (codes ?? []).some((c: string) => queryCodeSet.has(c))
+        const markerArr = Array.isArray(markers) ? markers : []
+        const markerInter = markerArr.filter((m: string) => queryMarkerSet.has(m)).length
+        const markerExtra = markerArr.filter((m: string) => !queryMarkerSet.has(m)).length
+        const markerRecall = queryMarkerSet.size > 0 ? markerInter / queryMarkerSet.size : 0
+        const markerPrecision = markerArr.length > 0 ? markerInter / markerArr.length : 0
+        const markerMatch = markerInter > 0 && queryMarkerSet.size > 0
         const exactMatch =
+          codeMatch ||
+          markerMatch ||
           namesForGate.some((n) => queryNameSet.has(n)) ||
           productNameListsContainmentMatch(queryNamesForGate, namesForGate)
         let bestSimilarity = -1
@@ -475,7 +754,23 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         }
 
         const semanticMatch = Number.isFinite(bestSimilarity) && bestSimilarity >= productNameSimilarityThreshold
-        return { doc, names, fileHint, namesForGate, exactMatch, semanticMatch, bestSimilarity, bestPair }
+        return {
+          doc,
+          names,
+          codes,
+          markers: markerArr,
+          fileHint,
+          namesForGate,
+          codeMatch,
+          markerMatch,
+          markerRecall,
+          markerPrecision,
+          markerExtra,
+          exactMatch,
+          semanticMatch,
+          bestSimilarity,
+          bestPair,
+        }
       })
 
     // Optional Ollama semantic gate for product names (meaning-based matching).
@@ -513,8 +808,52 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
       }
     }
     gatedWithNameDiagnostics = gatedWithNameDiagnostics.filter((x) => x.exactMatch || x.semanticMatch)
+    // If query has explicit product codes and any candidates match by code,
+    // keep only code-matched candidates.
+    const codeMatchedDocs = gatedWithNameDiagnostics.filter((x: any) => Boolean(x?.codeMatch))
+    if (queryCodes.length > 0 && codeMatchedDocs.length > 0) gatedWithNameDiagnostics = codeMatchedDocs
+    // If query has disease markers, prioritize candidates covering the same marker set.
+    if (queryMarkers.length > 0 && gatedWithNameDiagnostics.length > 0) {
+      const maxRecall = Math.max(...gatedWithNameDiagnostics.map((x: any) => Number(x?.markerRecall ?? 0)))
+      if (Number.isFinite(maxRecall) && maxRecall > 0) {
+        gatedWithNameDiagnostics = gatedWithNameDiagnostics.filter(
+          (x: any) => Number(x?.markerRecall ?? 0) >= maxRecall - 1e-9,
+        )
+        const maxPrecision = Math.max(...gatedWithNameDiagnostics.map((x: any) => Number(x?.markerPrecision ?? 0)))
+        if (Number.isFinite(maxPrecision) && maxPrecision > 0) {
+          gatedWithNameDiagnostics = gatedWithNameDiagnostics.filter(
+            (x: any) => Number(x?.markerPrecision ?? 0) >= maxPrecision - 1e-9,
+          )
+        }
+        const minExtra = Math.min(...gatedWithNameDiagnostics.map((x: any) => Number(x?.markerExtra ?? 999)))
+        if (Number.isFinite(minExtra)) {
+          gatedWithNameDiagnostics = gatedWithNameDiagnostics.filter(
+            (x: any) => Number(x?.markerExtra ?? 999) <= minExtra,
+          )
+        }
+      }
+    }
+    // If there are exact name matches, keep only them.
+    // This prevents cross-matching with semantically similar but different products.
+    const exactNameDocs = gatedWithNameDiagnostics.filter((x: any) => Boolean(x?.exactMatch))
+    if (exactNameDocs.length > 0) gatedWithNameDiagnostics = exactNameDocs
+    const nameDiagByDocId = new Map(
+      gatedWithNameDiagnostics.map((x: any) => [
+        String(x?.doc?.id ?? ''),
+        {
+          exactMatch: Boolean(x?.exactMatch),
+          semanticMatch: Boolean(x?.semanticMatch),
+          bestSimilarity: Number.isFinite(Number(x?.bestSimilarity)) ? Number(x?.bestSimilarity) : -1,
+        },
+      ]),
+    )
 
-    const gatedCandidateDocs = gatedWithNameDiagnostics.map((x) => x.doc)
+    let gatedCandidateDocs = gatedWithNameDiagnostics.map((x) => x.doc)
+    if (gatedCandidateDocs.length === 0) {
+      // Fallback: do not fail hard on product-name gate.
+      // Some tender files have noisy/partial names, while key parameters still match.
+      gatedCandidateDocs = candidateDocs
+    }
     if (gatedCandidateDocs.length === 0) {
       const libraryNameSamples = libDocNames.slice(0, 12).map(({ doc, names, fileHint, namesForGate }) => {
         let bestSimilarity = -1
@@ -633,15 +972,35 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         })
 
         const score = prop.totalPossible > 0 ? prop.points / prop.totalPossible : 0
+        const nameDiag = nameDiagByDocId.get(String((doc as any)?.id ?? ''))
+        const gateDiag = gatedWithNameDiagnostics.find((x: any) => String(x?.doc?.id ?? '') === String((doc as any)?.id ?? '')) as any
         return {
           doc,
           score,
           matchedCount: prop.points,
           totalCount: prop.totalPossible,
           matchedKeys: prop.matchedIndicators,
+          exactNameMatch: Boolean(nameDiag?.exactMatch),
+          nameSimilarity: Number.isFinite(Number(nameDiag?.bestSimilarity)) ? Number(nameDiag?.bestSimilarity) : -1,
+          markerRecall: Number.isFinite(Number(gateDiag?.markerRecall)) ? Number(gateDiag?.markerRecall) : 0,
+          markerPrecision: Number.isFinite(Number(gateDiag?.markerPrecision)) ? Number(gateDiag?.markerPrecision) : 0,
         }
       })
-      .sort((a, b) => b.score - a.score)
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score
+        if (b.matchedCount !== a.matchedCount) return b.matchedCount - a.matchedCount
+        const aMarkerRecall = Number.isFinite(Number(a.markerRecall)) ? Number(a.markerRecall) : 0
+        const bMarkerRecall = Number.isFinite(Number(b.markerRecall)) ? Number(b.markerRecall) : 0
+        if (bMarkerRecall !== aMarkerRecall) return bMarkerRecall - aMarkerRecall
+        const aMarkerPrecision = Number.isFinite(Number(a.markerPrecision)) ? Number(a.markerPrecision) : 0
+        const bMarkerPrecision = Number.isFinite(Number(b.markerPrecision)) ? Number(b.markerPrecision) : 0
+        if (bMarkerPrecision !== aMarkerPrecision) return bMarkerPrecision - aMarkerPrecision
+        if (Number(b.exactNameMatch) !== Number(a.exactNameMatch)) return Number(b.exactNameMatch) - Number(a.exactNameMatch)
+        const aNameSim = Number.isFinite(Number(a.nameSimilarity)) ? Number(a.nameSimilarity) : -1
+        const bNameSim = Number.isFinite(Number(b.nameSimilarity)) ? Number(b.nameSimilarity) : -1
+        if (bNameSim !== aNameSim) return bNameSim - aNameSim
+        return 0
+      })
 
     const heuristicBest = scoredDocs[0]
     // LLM judge step (neural network) for final decision.
@@ -653,7 +1012,8 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     let llmError: string | null = null
     const judgeProvider = String(process.env.JUDGE_PROVIDER ?? '').toLowerCase()
     const heuristicEnough = heuristicBest.matchedCount >= minCriteriaIfNameMatched
-    const shouldRunLlm = !(skipLlmWhenHeuristicConfident && heuristicEnough)
+    const disableLlm = String(process.env.MATCH_DISABLE_LLM ?? 'false') === 'true'
+    const shouldRunLlm = !disableLlm && !(skipLlmWhenHeuristicConfident && heuristicEnough)
     if (shouldRunLlm) {
       try {
         const queryRowsForJudge = (queryRows as any[])
@@ -673,6 +1033,12 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         })
 
         if (!llm) {
+          const noLlmConfigured =
+            !judgeProvider && !process.env.OPENAI_API_KEY && !process.env.OLLAMA_URL
+          if (noLlmConfigured) {
+            // LLM is intentionally disabled; do not surface this as an error.
+            llmError = null
+          } else
           if (judgeProvider === 'openai') {
             if (!process.env.OPENAI_API_KEY) {
               llmError =
@@ -690,19 +1056,31 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         }
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e)
-        // Provide the original failure reason to help debugging proxy/VPN issues.
-        llmError = `Ошибка при вызове нейросети (подробности): ${message}. Используется эвристика.`
+        // If request was aborted (timeout/cancel), keep UI clean and silently use heuristic.
+        if (message.toLowerCase().includes('aborted')) {
+          llmError = null
+        } else {
+          // Provide the original failure reason to help debugging proxy/VPN issues.
+          llmError = `Ошибка при вызове нейросети (подробности): ${message}. Используется эвристика.`
+        }
         llm = null
       }
     } else {
       llmError = 'Нейросеть пропущена: эвристика уже выполнила критерий совпадения.'
     }
 
-    // For Ollama judge we trust model decision/similarity as final.
+    // Prefer deterministic heuristic when it already meets criteria.
+    // This avoids false "no_match" from LLM on partially-structured tender docs.
     const decisionByCriteriaIfNameMatched: JudgeDecision =
       heuristicBest.matchedCount >= minCriteriaIfNameMatched ? 'match' : 'no_match'
+    const llmContradictsStrongHeuristic =
+      judgeProvider === 'ollama' &&
+      heuristicEnough &&
+      llm?.decision === 'no_match'
     const decision: JudgeDecision =
-      judgeProvider === 'ollama' && llm?.decision
+      llmContradictsStrongHeuristic
+        ? decisionByCriteriaIfNameMatched
+        : judgeProvider === 'ollama' && llm?.decision
         ? llm.decision
         : decisionByCriteriaIfNameMatched
 
@@ -740,8 +1118,17 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
               toleranceRel: Number(process.env.MATCH_VALUE_TOLERANCE_REL ?? 0.1),
               toleranceAbs: Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0),
             })
+            const fallbackTextMatch =
+              aliasPair &&
+              ((
+                indicatorLooksComposition(qRow.indicator) &&
+                indicatorLooksComposition(lRow.indicator)
+              ) ||
+                (indicatorLooksPurposeOrDescription(qRow.indicator) &&
+                  indicatorLooksPurposeOrDescription(lRow.indicator))) &&
+              compositionLongTextFallbackMatch(qRow.valueRaw, lRow.valueRaw)
 
-            if (m.match && s > bestSimValueMatch) {
+            if ((m.match || fallbackTextMatch) && s > bestSimValueMatch) {
               bestSimValueMatch = s
               bestLibValueMatch = lRow
             }
@@ -756,12 +1143,22 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
                 toleranceAbs: Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0),
               })
             : { match: false, reason: 'no candidate' }
+          const fallbackTextMatch =
+            chosenLib != null &&
+            tenderAliasesAllowValueCompare(qRow.indicator, chosenLib.indicator) &&
+            ((
+              indicatorLooksComposition(qRow.indicator) &&
+              indicatorLooksComposition(chosenLib.indicator)
+            ) ||
+              (indicatorLooksPurposeOrDescription(qRow.indicator) &&
+                indicatorLooksPurposeOrDescription(chosenLib.indicator))) &&
+            compositionLongTextFallbackMatch(qRow.valueRaw, chosenLib.valueRaw)
 
           const bestSimForIndicatorOk = chosenLib === bestLibValueMatch ? bestSimValueMatch : bestSimAll
           const indicatorOk =
             bestSimForIndicatorOk >= indicatorSimilarityThreshold ||
             (chosenLib != null && tenderAliasesAllowValueCompare(qRow.indicator, chosenLib.indicator))
-          const valueOk = Boolean(m.match)
+          const valueOk = Boolean(m.match || fallbackTextMatch)
 
           return {
             indicator: qRow.indicator,
@@ -771,7 +1168,11 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
             indicatorSimilarity: bestSimForIndicatorOk,
             valueMatch: valueOk,
             indicatorOk,
-            valueReason: m.reason,
+            valueReason: m.match
+              ? m.reason
+              : fallbackTextMatch
+                ? 'composition long-text fallback'
+                : m.reason,
             rowMatched: indicatorOk && valueOk,
           }
         })
@@ -779,6 +1180,19 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         rowResults = rowResults.filter((r) => Boolean(r.rowMatched))
       }
     }
+
+    const matchedCountByRows = rowResults.length
+    const matchedCountOut = Math.max(selected.matchedCount, matchedCountByRows)
+    const rawMatchPercentOut =
+      selected.totalCount > 0 ? (matchedCountOut / selected.totalCount) * 100 : 0
+    const minMatchPercentForCompliance = Number(process.env.MATCH_MIN_PERCENT_FOR_COMPLIANCE ?? 30)
+    const belowMinPercent = rawMatchPercentOut < minMatchPercentForCompliance
+    const decisionOut: JudgeDecision = belowMinPercent
+      ? 'no_match'
+      : matchedCountOut >= minCriteriaIfNameMatched
+        ? 'match'
+        : decision
+    const matchPercentOut = rawMatchPercentOut
 
     res.json({
       ok: true,
@@ -791,10 +1205,10 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
       thresholdUsed: passThresholdPercent,
       indicatorSimilarityThresholdUsed: indicatorSimilarityThreshold,
       minCriteriaIfNameMatched,
-      decision,
+      decision: decisionOut,
       bestScore: selected.score,
-      matchPercent: Number.isFinite(selected.score) ? selected.score * 100 : 0,
-      matchedCount: selected.matchedCount,
+      matchPercent: matchPercentOut,
+      matchedCount: matchedCountOut,
       totalCount: selected.totalCount,
       bestMatchFilename: selected.doc?.originalFilename ?? null,
       rowResults,
@@ -803,9 +1217,10 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
       llmSimilarity: llm?.similarity ?? null,
       llmExplanation:
         llm?.explanation && llm.explanation.trim().length > 0 ? llm.explanation : llmError ?? null,
+      analyzerInfo,
       // We return only the best matching document.
       matches:
-        decision === 'match'
+        decisionOut === 'match'
           ? scoredDocs.slice(0, 1).map((m) => ({
               id: m.doc.id,
               originalFilename: m.doc.originalFilename,

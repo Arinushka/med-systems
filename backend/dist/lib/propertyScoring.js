@@ -1,5 +1,5 @@
-import { cosineSimilarity } from '../utils/cosine';
-import { valuesMatch } from './valueCompare';
+import { cosineSimilarity } from '../utils/cosine.js';
+import { valuesMatch } from './valueCompare.js';
 const DEFAULT_WEIGHTS = {
     analytical_sensitivity_ng_ml: 3,
     sensitivity_percent: 3,
@@ -52,8 +52,8 @@ export function categorizeIndicator(indicator) {
 function unitTokensMatch(a, b) {
     const na = normalize(a);
     const nb = normalize(b);
-    const aHasPercent = na.includes('%') || na.includes('percent') || na.includes('проц');
-    const bHasPercent = nb.includes('%') || nb.includes('percent') || nb.includes('проц');
+    const aHasPercent = na.includes('%') || /\bpercent\b/.test(na) || na.includes('процент');
+    const bHasPercent = nb.includes('%') || /\bpercent\b/.test(nb) || nb.includes('процент');
     if (aHasPercent || bHasPercent) {
         return aHasPercent === bHasPercent;
     }
@@ -67,7 +67,7 @@ function unitTokensMatch(a, b) {
 }
 function hasPercent(raw) {
     const n = normalize(raw);
-    return n.includes('%') || n.includes('percent') || n.includes('проц');
+    return n.includes('%') || /\bpercent\b/.test(n) || n.includes('процент');
 }
 function hasNgMl(raw) {
     const n = normalize(raw);

@@ -1,5 +1,5 @@
 import OpenAI from 'openai'
-import { createProxiedOpenaiFetch } from './openaiFetchProxy'
+import { createProxiedOpenaiFetch } from './openaiFetchProxy.js'
 
 export type JudgeDecision = 'match' | 'no_match'
 
@@ -133,24 +133,39 @@ async function judgeWithOllama(params: { prompt: string }): Promise<JudgeResult 
 
   const model = process.env.OLLAMA_MODEL ?? 'llama3'
   const numPredict = Number(process.env.OLLAMA_NUM_PREDICT ?? 80)
-  const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 20000)
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 60000)
+  const callOllama = async (effectiveTimeoutMs: number): Promise<Response> => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs)
+    try {
+      return await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: params.prompt }],
+          stream: false,
+          options: { temperature: 0, num_predict: numPredict },
+        }),
+      })
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  const retryOnAbort = String(process.env.OLLAMA_RETRY_ON_ABORT ?? 'false') === 'true'
   let response: Response
   try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: params.prompt }],
-        stream: false,
-        options: { temperature: 0, num_predict: numPredict },
-      }),
-    })
-  } finally {
-    clearTimeout(timer)
+    response = await callOllama(timeoutMs)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (retryOnAbort && msg.toLowerCase().includes('aborted')) {
+      // Optional retry for loaded local models; disabled by default for latency.
+      response = await callOllama(timeoutMs)
+    } else {
+      throw e
+    }
   }
 
   if (!response.ok) {
@@ -245,24 +260,38 @@ export async function compareProductNamesWithOllama(params: {
   if (!url) return null
   const model = process.env.OLLAMA_MODEL ?? 'llama3'
   const numPredict = Number(process.env.OLLAMA_NUM_PREDICT ?? 80)
-  const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 12000)
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const timeoutMs = Number(process.env.OLLAMA_TIMEOUT_MS ?? 30000)
+  const callOllama = async (effectiveTimeoutMs: number): Promise<Response> => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs)
+    try {
+      return await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          stream: false,
+          options: { temperature: 0, num_predict: numPredict },
+        }),
+      })
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  const retryOnAbort = String(process.env.OLLAMA_RETRY_ON_ABORT ?? 'false') === 'true'
   let response: Response
   try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: prompt }],
-        stream: false,
-        options: { temperature: 0, num_predict: numPredict },
-      }),
-    })
-  } finally {
-    clearTimeout(timer)
+    response = await callOllama(timeoutMs)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (retryOnAbort && msg.toLowerCase().includes('aborted')) {
+      response = await callOllama(timeoutMs)
+    } else {
+      throw e
+    }
   }
   if (!response.ok) return null
   const data: any = await response.json().catch(() => null)

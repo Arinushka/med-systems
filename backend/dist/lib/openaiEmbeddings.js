@@ -1,6 +1,6 @@
 import OpenAI from 'openai';
-import { embedTextsLocal } from './localEmbeddings';
-import { createProxiedOpenaiFetch } from './openaiFetchProxy';
+import { embedTextsLocal } from './localEmbeddings.js';
+import { createProxiedOpenaiFetch } from './openaiFetchProxy.js';
 export async function embedTexts(texts) {
     const provider = String(process.env.EMBEDDINGS_PROVIDER ?? '').toLowerCase();
     if (provider === 'local') {

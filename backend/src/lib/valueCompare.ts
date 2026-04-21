@@ -12,6 +12,24 @@ export function parseNumbers(raw: string): number[] {
 export function extractRange(raw: string): { min: number; max: number } | null {
   const s0 = raw.replace(/\s/g, '').toLowerCase()
 
+  // 0) Combined bounds in one expression, e.g. ">=5и<=9", "не менее 5 и не более 9".
+  const combinedA = s0.match(
+    /(?:>=|≥|неменее|нениже|от)\D*(-?\d+(?:[.,]\d+)?)[\s\S]{0,20}?(?:<=|≤|неболее|довключительно|до)\D*(-?\d+(?:[.,]\d+)?)/i,
+  )
+  if (combinedA) {
+    const a = Number(normalizeNumberString(combinedA[1]))
+    const b = Number(normalizeNumberString(combinedA[2]))
+    if (Number.isFinite(a) && Number.isFinite(b)) return a <= b ? { min: a, max: b } : { min: b, max: a }
+  }
+  const combinedB = s0.match(
+    /(?:<=|≤|неболее|довключительно|до)\D*(-?\d+(?:[.,]\d+)?)[\s\S]{0,20}?(?:>=|≥|неменее|нениже|от)\D*(-?\d+(?:[.,]\d+)?)/i,
+  )
+  if (combinedB) {
+    const a = Number(normalizeNumberString(combinedB[1]))
+    const b = Number(normalizeNumberString(combinedB[2]))
+    if (Number.isFinite(a) && Number.isFinite(b)) return a <= b ? { min: a, max: b } : { min: b, max: a }
+  }
+
   // 1) Try ranges like "a - b", "a–b", "a—b"
   const rangeMatch = s0.match(/(-?\d+(?:[.,]\d+)?)\s*[-–—]\s*(-?\d+(?:[.,]\d+)?)/)
   if (rangeMatch) {
@@ -56,6 +74,52 @@ export function extractRange(raw: string): { min: number; max: number } | null {
 
 export function normalizeTextSimple(s: string): string {
   return s.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function tokenizeText(s: string): string[] {
+  return normalizeTextSimple(s)
+    .split(/[^a-z0-9а-яё]+/gi)
+    .map((t) => t.trim())
+    .filter(Boolean)
+}
+
+function textMatchFallback(q: string, l: string): { match: boolean; reason: string } {
+  const qn = normalizeTextSimple(q)
+  const ln = normalizeTextSimple(l)
+  if (!qn || !ln) return { match: false, reason: 'empty values' }
+  if (qn === ln) return { match: true, reason: 'exact text match' }
+  const qTokens = tokenizeText(qn)
+  const lTokens = tokenizeText(ln)
+  if (qTokens.length === 0 || lTokens.length === 0) return { match: false, reason: 'no tokens' }
+
+  // Biological material matching: tolerate list vs single item
+  // (e.g. "кровь; сыворотка; плазма" vs "цельная кровь").
+  const materialLexemes = ['кров', 'сыворот', 'плазм', 'цельн']
+  const qMaterial = new Set(materialLexemes.filter((x) => qn.includes(x)))
+  const lMaterial = new Set(materialLexemes.filter((x) => ln.includes(x)))
+  if (qMaterial.size > 0 && lMaterial.size > 0) {
+    let interMat = 0
+    for (const m of qMaterial) if (lMaterial.has(m)) interMat++
+    if (interMat > 0) return { match: true, reason: 'biological material overlap' }
+  }
+  const qSet = new Set(qTokens)
+  const lSet = new Set(lTokens)
+  let inter = 0
+  for (const t of qSet) if (lSet.has(t)) inter++
+  const jaccard = inter / Math.max(1, qSet.size + lSet.size - inter)
+  const bothLong = qn.length >= 80 && ln.length >= 80
+  const threshold = bothLong ? 0.12 : 0.85
+  const ok = jaccard >= threshold
+  return { match: ok, reason: ok ? `token overlap jaccard=${jaccard.toFixed(2)}` : `low token overlap jaccard=${jaccard.toFixed(2)}` }
+}
+
+function looksTextualWithIncidentalDigits(raw: string): boolean {
+  const s = (raw ?? '').toString()
+  const tokens = tokenizeText(s)
+  const longText = tokens.length >= 8
+  const letterCount = (s.match(/[a-zа-яё]/gi) ?? []).length
+  const digitCount = (s.match(/\d/g) ?? []).length
+  return longText && letterCount >= 20 && digitCount > 0 && letterCount >= digitCount * 3
 }
 
 /**
@@ -147,6 +211,12 @@ export function valuesMatch(params: {
     }
   }
 
+  // Long textual criteria can include incidental digits (e.g. "ВИЧ 1/2", "HIV1/HIV2").
+  // In such cases use text overlap, not strict numeric comparison.
+  if (qHasDigits && lHasDigits && looksTextualWithIncidentalDigits(q) && looksTextualWithIncidentalDigits(l)) {
+    return textMatchFallback(q, l)
+  }
+
   // If both contain digits, compare numerically (numbers/ranges) only.
   if ((qHasDigits || qRange) && (lHasDigits || lRange) && !qRange && !lRange && qNumbers.length > 0 && lNumbers.length > 0) {
     const qv = qNumbers[0]
@@ -172,24 +242,6 @@ export function valuesMatch(params: {
   }
 
   // No digits on both sides => compare normalized tokens with strict overlap.
-  const qn = normalizeTextSimple(q)
-  const ln = normalizeTextSimple(l)
-  if (!qn || !ln) return { match: false, reason: 'empty values' }
-
-  if (qn === ln) return { match: true, reason: 'exact text match' }
-
-  const qTokens = qn.split(/\W+/).filter(Boolean)
-  const lTokens = ln.split(/\W+/).filter(Boolean)
-  if (qTokens.length === 0 || lTokens.length === 0) return { match: false, reason: 'no tokens' }
-
-  const qSet = new Set(qTokens)
-  const lSet = new Set(lTokens)
-  let inter = 0
-  for (const t of qSet) {
-    if (lSet.has(t)) inter++
-  }
-  const jaccard = inter / Math.max(1, qSet.size + lSet.size - inter)
-  const ok = jaccard >= 0.85
-  return { match: ok, reason: ok ? `token overlap jaccard=${jaccard.toFixed(2)}` : `low token overlap jaccard=${jaccard.toFixed(2)}` }
+  return textMatchFallback(q, l)
 }
 
