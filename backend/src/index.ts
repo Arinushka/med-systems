@@ -1,4 +1,5 @@
 import dotenv from 'dotenv'
+import nodemailer from 'nodemailer'
 
 import express from 'express'
 import cors from 'cors'
@@ -24,6 +25,1421 @@ import {
 import { extractNormalizedProductNamesFromRows } from './lib/productName.js'
 
 const app = express()
+const MATCH_NOTIFY_EMAIL = 'arina.mykhova@yandex.ru'
+
+type TenderKeyEnrichment = {
+  Text: string[]
+  Exclude: string[]
+}
+
+const TENDER_KEY_ENRICHMENTS: Record<string, TenderKeyEnrichment> = {
+  'прокальцитонин общий': {
+    Text: ['прокальцитонин*', 'сепсис*', 'brahms pct'],
+    Exclude: [
+      'посуд*',
+      'антигололедн*',
+      'диски',
+      'оказан* услуг*',
+      'монтаж*',
+      'ремонт*',
+      'канцтовар*',
+      'канцелярск*',
+      'канц-товар*',
+      'вакцин',
+      'продукт* питан*',
+      'тестер',
+      'наконечник*',
+      'пробирки',
+      'ПЦР',
+      'литератур*',
+      'противогололедн*',
+      'стоматолог*',
+      'выполнен* услуг*',
+      'RAMP',
+      '(easy reader)',
+      'getein',
+      '(иммунофлуоресцентн* анализ*)~2',
+      'иммунохемилюминесцентн*',
+      '(ам 770)',
+      'ам770',
+      'maglumi',
+    ],
+  },
+  'фобы общий': {
+    Text: [
+      'скрыт* кров*',
+      'кров* кал*',
+      'определен* гемоглобин*',
+      'выявлен* гемоглобин*',
+      'fob',
+      'кров* фекал*',
+      'кров* в кал* ИВД',
+      'кров* ИВД',
+    ],
+    Exclude: [
+      'посуд*',
+      'антигололедн*',
+      'диски',
+      'услуг*',
+      'монтаж*',
+      'ремонт*',
+      'канцтовар*',
+      'канцелярск*',
+      'канц-товар*',
+      'вакцин',
+      'продукт* питан*',
+      'тестер',
+      'наконечник*',
+      'пробирки',
+      'ПЦР',
+      'литератур*',
+      'противогололедн*',
+      'стоматолог*',
+      'таблетки*',
+      'раствор* инфуз*',
+      'крупа',
+      'раствор* инъекц*',
+      'чип-сенсор*',
+      'fob порт',
+      'благоустроенная квартира',
+      'щебня',
+      '(язык* говя*)',
+      '(анализатор* bs)~1',
+      '(мебел* офис*)~2',
+      '(лекарствен* препарат*)~1',
+      '(мяс* птиц*)~1',
+      'цитофлуориметр*',
+      '(getein 1100)',
+      'getein',
+      '(easy reader)',
+      '(иммунофлуоресцентн* анализ*)~2',
+      'i-stat',
+      '(Gem Premier)',
+      'furuno',
+      '(ABL 800)~1',
+      'easyreader',
+      'vitaline',
+      'NS-PRIME',
+      '(кабельн* продукц*)~2',
+      'РЕФЛЕКОМ',
+      'АМ900',
+      '(ам-900)',
+      '(кроват* металл*)~2',
+      '(Mindray BS)~2',
+      '(Mindray BC)~2',
+    ],
+  },
+  'тесты для кдл': {
+    Text: [
+      'реагент* "КДЛ"',
+      'Прокальцитон*',
+      'тест* "КДЛ"',
+      'Регаен* для КДЛ',
+      'тест* для КДЛ',
+      'реактив* для КДЛ',
+      'азур-эозин',
+      'реактив* для лаборатор*',
+    ],
+    Exclude: [
+      'scangel',
+      'alinity',
+      '(cobas 6000)~1',
+      '(иммунохемилюминесцент* анализ*)~1',
+      '(easy reader)',
+      '(лабораторн* мебел*)~1',
+      '(определ* иммун* статус*)~3',
+      '(анализатор* AQT90)',
+      '(иммунофлуоресцентн* анализ*)~2',
+      '(Gem Premier)',
+      '(анализ* ACL)~2',
+      '(анализатор* электролит*)~5',
+      '(поставк* пцр исследован*)~5',
+      '(оказание услуг)',
+      'access',
+      '(Sysmex XN-1000)',
+      'ramp',
+      'fus-2000',
+      '(fus 2000)~1',
+      '(Mindray BS)~2',
+      '(Mindray BC)~2',
+      'MAGLUMI',
+      'Radiometr*',
+      'услуг*',
+      'охран*',
+      'бенз*',
+      'работ*',
+      'молоко',
+      'услуг*',
+      'работ*',
+      'услуги',
+    ],
+  },
+  'ковид общий': {
+    Text: [
+      'ковид*',
+      'sars-cov-2',
+      'sars-cov',
+      'covid',
+      'антиген* ковид*',
+      'covid-19',
+      'коронавирус*',
+    ],
+    Exclude: [
+      'посуд*',
+      'антигололедн*',
+      'диски',
+      'услуг*',
+      'монтаж*',
+      'ремонт*',
+      'канцтовар*',
+      'канцелярск*',
+      'канц-товар*',
+      'вакцин',
+      'продукт* питан*',
+      'тестер',
+      'наконечник*',
+      'пробирки',
+      'ПЦР',
+      'литератур*',
+      'противогололедн*',
+      'стоматолог*',
+      'таблетки*',
+      'раствор* инфуз*',
+      'крупа',
+      'раствор* инъекц*',
+      'полиграфическ*',
+      '(getein 1100)',
+      'getein',
+      'MAGLUMI',
+    ],
+  },
+  'инфекции общий': {
+    Text: [
+      'вирус* гепатит*',
+      'антиген* гепатит*',
+      'антител* гепатит*',
+      'ВИЧ1/ВИЧ2',
+      'иммунохром* ВИЧ',
+      'иммунохром* гепатит*',
+      'антител* ВИЧ',
+      'HIV1',
+      'вирус* спид*',
+      'вирус* иммунодефицит*',
+      'Treponema pallidum иммухром*',
+      'иммунохром* сифилис*',
+      'иммунохром* пса',
+      'антиген* пса',
+      'антиген* psa',
+      'иммунохром* psa',
+      'антител* спид*',
+      'Общ* простатическ* специфическ* антиген* (ПСА)',
+      'Вирус* гепатит* В поверхностн* антиген* "ИВД"',
+      'Вирус* гепатит* С общи* антител* "ИВД"',
+      'Treponema pallidum общ* антител* "ИВД"',
+      'ВИЧ2 антител* "ИВД"',
+      'Общ* простатическ* специфическ* антиген* (ПСА) "ИВД"',
+      'Общ* простатическ* специфическ* антиген* "ПСА"',
+      'ВИЧ1 антител* "ИВД"',
+      '"ВИЧ 1" антител* "ИВД"',
+      '"ВИЧ-1" антител* "ИВД"',
+      '"ВИЧ 2" антител* "ИВД"',
+      '"ВИЧ-2" антител* "ИВД"',
+      'Общ* простатическ* специфическ* антиген* "ПСА" "ИВД"',
+    ],
+    Exclude: [
+      'посуд*',
+      'антигололедн*',
+      'диски',
+      'оказан* услуг*',
+      'монтаж*',
+      'ремонт*',
+      'канцтовар*',
+      'канцелярск*',
+      'канц-товар*',
+      'вакцин',
+      'продукт* питан*',
+      'тестер',
+      'наконечник*',
+      'пробирки',
+      'ПЦР',
+      'литератур*',
+      'противогололедн*',
+      'стоматолог*',
+      'таблетки*',
+      'раствор* инфуз*',
+      'крупа',
+      'раствор* инъекц*',
+      'полиграфическая продукция',
+      'лекарствен* препарат*',
+      'бланк*',
+      'груз* автомобил*',
+      'грузов* транспорт*',
+      'запасн* част*',
+      'выполнен* услуг*',
+      'ARCHITECT*',
+      'alinity',
+      '(иммунофлуоресцентн* анализ*)~2',
+      '(иммунохемилюминесцент* анализ*)~2',
+      '(Cobas TaqMan)',
+      '(easy reader)',
+    ],
+  },
+  'кардио и наркотики общий': {
+    Text: [
+      'кардиотест*',
+      'кардиопанел*',
+      'кардиомаркер*',
+      'наркот* анализ*',
+      'наркопанел*',
+      'наркотест*',
+      'наркот* тест*',
+      'наркотическ* соединен*',
+      'множественн* наркот*',
+      'наркот* веществ*',
+      'мультитест*',
+      'иммунохром* наркот*',
+      'тропонин*',
+      'тропонинп*',
+      'иммунохром* Тропонин I',
+      'Тропонин I ИВД',
+      'инфаркт* миокард*',
+      'Множествен* маркер* сердечно-сосудист* заболеван* "ИВД"',
+      'D-димер* "ИВД"',
+      'D-димер*',
+      'Д-димер*',
+      'иммунохром* D-димер*',
+      'D-dimer*',
+      'Множествен* маркер* сердечнососудист* заболеван* "ИВД"',
+      'Множествен* маркер* сердечн* сосудист* заболеван* "ИВД"',
+      '("D" димер* "ИВД")~5',
+      '("Д" димер* "ИВД")~5',
+      '("Д" димер*)~2',
+      '("D" димер*)~2',
+      'бензодиаз* иммунохром*',
+      'метадон* иммунохром*',
+      'амфетамин* иммунохром*',
+      'метамфетам* иммунохром*',
+      'кокаин* иммунохром*',
+      'морфин* иммунохром*',
+      'Тропонин I ИВД',
+      'вид* наркот*',
+      'инфаркт* миокард*',
+      'синтетическ* наркот*',
+    ],
+    Exclude: [
+      'посуд*',
+      'антигололедн*',
+      'оказан* услуг*',
+      'монтаж*',
+      'ремонт*',
+      'канцтовар*',
+      'канцелярск*',
+      'канц-товар*',
+      'вакцин',
+      'продукт* питан*',
+      'тестер',
+      'наконечник*',
+      'пробирки',
+      'ПЦР',
+      'литератур*',
+      'противогололедн*',
+      'стоматолог*',
+      'таблетки*',
+      'раствор* инфуз*',
+      'крупа',
+      'раствор* инъекц*',
+      'полиграфическая продукция',
+      'лекарствен* препарат*',
+      'бланк*',
+      'запасн* част*',
+      'выполнен* услуг*',
+      'благоустройств*',
+      'pathfast',
+      '(сармат СВ)',
+      '(easy reader)',
+      '(АМ-900)',
+      '(getein 1100)',
+      'getein',
+      '(иммунофлуоресцентн* анализ*)~2',
+      'рефлеком',
+      '(иммунохемилюминесцент* анализ*)~2',
+      '(Technology Solution)',
+      '(анализ* ACL)',
+      'сармат',
+      'ramp',
+      '(ам 770)',
+      'ам770',
+      '(Mindray BS)~2',
+      '(Mindray BC)~2',
+      '(CL-1200i)',
+    ],
+  },
+  'кишечные вирусы': {
+    Text: [
+      'аденовирус*',
+      'ротавирус*',
+      'ротовирус*',
+      'анализ* кал*',
+      'скрининг* кал*',
+      'Ротавирус антигены ИВД',
+      'иммухром* фекал*',
+      'аденавирус',
+      'Множественн* вирус* желудочно-кишечн* тракт*',
+      'энтеровирус',
+    ],
+    Exclude: [
+      'посуд*',
+      'антигололедн*',
+      'диски',
+      'оказан* услуг*',
+      'монтаж*',
+      'ремонт*',
+      'канцтовар*',
+      'канцелярск*',
+      'канц-товар*',
+      'вакцин',
+      'продукт* питан*',
+      'тестер',
+      'наконечник*',
+      'пробирки',
+      'ПЦР',
+      'литератур*',
+      'противогололедн*',
+      'стоматолог*',
+      'таблетки*',
+      'раствор* инфуз*',
+      'крупа',
+      'раствор* инъекц*',
+      'полиграфическая продукция',
+      'лекарствен* препарат*',
+      'бланк*',
+      'груз* автомобил*',
+      'грузов* транспорт*',
+      'запасн* част*',
+      'выполнен* услуг*',
+      'скрыт* кров*',
+      'калибровк*',
+      'поверк*',
+      'Architect',
+      'вод* бутилированн*',
+      'вода* питьев*',
+      '(лакокрасочн* продукц*)',
+      '(поставк* утеплител*)',
+      '(поставк* топлив*)',
+      '(Beckman Coulter)',
+      '(cobas 8000)',
+      '(vitaray 150)',
+      '(иммунохемилюминесцентн* анализ*)~2',
+      'easylite',
+      '(поставк* угл*)~1',
+      '(cobas e 411)',
+      '(cobas e411)',
+      'alinity',
+      '(Mindray ВS-800)',
+      'humastar',
+      '(Gem Premier)',
+      'furuno',
+      '(анализ* ACL)~2',
+      '(ABL 800)~1',
+      '(immulite-2000)',
+      '(sta compact)',
+      '(super GL)',
+      '(Technology Solution)',
+      '(DIRUI CS-300B)',
+      'lifotronic',
+      'рефлеком',
+      'ам900',
+      '(ам-900)',
+      'accent',
+      '(Mindray BS)~2',
+      '(Mindray BC)~2',
+      '(ba-400)~2',
+      '(destiny plus)',
+      'fus-2000',
+      '(fus 2000)~1',
+      '(AU 480)',
+      'MAGLUMI',
+      '(CL-1200i)',
+      '(Коа Тест-4)',
+      '(КоаТест-4)',
+      'Radiometr',
+      '(easy reader)',
+    ],
+  },
+  тесты: {
+    Text: [
+      'экспресс-тест*',
+      'экспресс тест*',
+      'тест* лабораторн*',
+      'тест* лаборатор*',
+      'тест-систем*',
+      'тест* систем*',
+      'ручн* тест*',
+      'ручн* методик*',
+      'ручн* определен*',
+      'визуальн* тест*',
+      'визуальн* определен*',
+      'визуальн* метод*',
+      'тест* клиническ*',
+      'тест* клиник*',
+      'экспресс* определен*',
+      'экспресс* метод*',
+      'тест* иммунохром*',
+      'иммунохром* анализ*',
+      'ИХА',
+      'иммунохром* тест*',
+      'иммунохром* определен*',
+      'инфекц* определен*',
+      'инфекц* тест*',
+      'тест-картридж*',
+      'тест* картридж*',
+      'тест* кассет*',
+      'тест-кассет*',
+      'онкомаркаркер*',
+      'тест-полос*',
+      'тест* полос*',
+      'реагент* лаборатор*',
+      'набор* реагент*',
+      'расходн* лаборатор*',
+      'расходн* материал* лаборатор*',
+      'материал* клинико-диагностическ*',
+      'расходн* материал* клинико-диагностическ*',
+      'КДЛ',
+      'иммунологическ* исследован*',
+      'иммунологическ* определен*',
+      '21-20-23-110',
+      '20-59-52-199',
+      'реагент* клинико-диагностическ*',
+      'реагент* диагностическ*',
+      'экспресс-диагност*',
+      'экспресс диагност*',
+      'реагент* КДЛ',
+      'материал* КДЛ',
+      'лабораторн* диагност*',
+      'лабораторн* диагност*',
+      'бесприборн* исследован*',
+      'бесприборн* определен*',
+      'бесприборн* тест*',
+      'реагент* медицинск* применен*',
+      'материал* медицинск* применен*',
+      'реагент* клиническ* исследован*',
+      'материал* клиническ* исследован*',
+      'расходн* лаборатор* материал*',
+      'тест* заболеван*',
+      'реактив* клиническ* исследован*',
+      'издел* медицинск* лаборатор*',
+      'издел* медицин* лаборатор*',
+      'клинико-диагностическ*',
+      'клинико-диагностическ* лаборатор*',
+      'клинико-диагностическ* отделен*',
+      'общеклиническ* исследован*',
+      'общеклиническ* определен*',
+      'множественн* аналит* моч*',
+      'колориметрическ* тест-полоск*',
+      'clinitek',
+      'клинитек*',
+      'анализатор* моч*',
+      'экспресс - тест*',
+      'мочев* анализ*',
+      'реагент* диагност*',
+      'иммухром* метод*',
+      'Уриполиан*  или эквивален*',
+      'Уринополиан*',
+      'экспрес* анализ* мочи',
+      'для качественн* и полуколичественн*',
+      'Тест-полоск* индикаторн*',
+      'тест',
+      'теста',
+      'тестов',
+      'тесты',
+      '(тест-полос*)~0',
+      '(с-реактивн* бел*)~1',
+      'сифилис*',
+      'стрептокок*',
+      'Кетон* моч* ИВД',
+      'кетон*',
+      'глюкоз*',
+      'уробилиноген*',
+      'альбумин*',
+      'Диагностическ* полоск* для качественн* и полуколичественн* определен*',
+      'Множественн* аналит* мочи ИВД',
+      'Микроальбумин*',
+    ],
+    Exclude: [
+      'посуд*',
+      'антигололедн*',
+      'диски',
+      'услуг*',
+      'монтаж*',
+      'ремонт*',
+      'канцтовар*',
+      'канцелярск*',
+      'канц-товар*',
+      'вакцин',
+      'продукт* питан*',
+      'тестер',
+      'наконечник*',
+      'пробирки',
+      'ПЦР',
+      'литератур*',
+      'противогололедн*',
+      'стоматолог*',
+      'электрод',
+      'ARHITECT*',
+      'качества молока',
+      '(иммунохемилюминесцент* анализатор*)~2',
+      '(иммунохемилюминесцент* метод*)~2',
+      'alisei',
+      'sysmex',
+      'hemalit',
+      '(cobas 8000)',
+      '(аграрн* групп*)~1',
+      'scangel',
+      '(анализатор* bs-6800)~1',
+      'architect',
+      'alinity',
+      '(cobas 6000)~1',
+      '(сармат СВ)',
+      '(электрохемилюминесцент* анализ*)~1',
+      '(getein 1100)~1',
+      '(easy reader)',
+      'getein',
+      '(Quo-Lab Analyzer)',
+      '(sta compact)',
+      'vitek',
+      '(анализатор* BS-)~1',
+      '(анализатор* BC-)~2',
+      '(поставк* дезинфицир*)~2',
+      '(getein1100)',
+      '(furuno CA)~2',
+      'гемадифф',
+      '(Technology Solution)',
+      'Dymind',
+      'цитофлуориметр*',
+      '(Ilab Taurus)',
+      '(АМ-900)',
+      '(выявлен* ДНК)',
+      '(анализатор* ACL)~2',
+      'easystat',
+      '(анализатор* AQT90)',
+      '(АU 480)',
+      '(автодельфи*)',
+      '(иммунофлуоресцентн* анализ*)~2',
+      '(cl-500)',
+      '(cl-50)',
+      '(Beckman Coulter)',
+      '(access)',
+      'рефлеком',
+      'i-stat',
+      '(для коагуломет* ACL)~2',
+      '(Gem Premier)',
+      'furuno',
+      '(хемилюминесцент* анализ*)~2',
+      '(анализатор* электролит*)~5',
+      '(ABL 800)~1',
+      '(иммунохемилюминесцент* анализ*)~2',
+      'alegria',
+      '(easy reader)',
+      'easyreader',
+      '(immulite-2000)',
+      '(super GL)',
+      '(ВС-3600)',
+      '(Стресс-тест систем*)',
+      '(Cobas TaqMan)',
+      '(Galileo Neo)',
+      'accent',
+      'сармат',
+      'fus-2000',
+      '(fus 2000)~1',
+      'ramp',
+      'рефлеком',
+      'ам900',
+      '(ам-900)',
+      '(зуботехническ* лаборатор*)~2',
+      '(зуботехническ* инструмент*)~2',
+      '(ам 770)',
+      'ам770',
+      '(Mindray BS)~2',
+      'ventana',
+      '(Mindray BC)~2',
+      '(AU 480)',
+      '(ABL 90)',
+      'MAGLUMI',
+      '(easy stat)',
+      '(CL-1200i)',
+      '(Коа Тест-4)',
+      '(КоаТест-4)',
+      'Radiometr',
+      '(CELL-DYN)',
+      'easylyte',
+      'бензин',
+      'работ*',
+      'услуги',
+    ],
+  },
+  документация: {
+    Text: [
+      'тест-кассет*',
+      'тест" кассет"',
+      'тест-картридж*',
+      'тест* картридж*',
+      'тест-полос*',
+      'тест* полос*',
+      'множественн* аналит* моч*',
+      'колориметрическ* тест-полос*',
+      'колориметрическ* тест*',
+    ],
+    Exclude: [
+      'посуд*',
+      'антигололед*',
+      'диски',
+      'услуг*',
+      'монтаж*',
+      'ремонт*',
+      'канцтовар*',
+      'канцелярск*',
+      'канц-товар*',
+      'лекарственн*',
+      'лекарств*',
+      'вакцин*',
+      'продукт* питан*',
+      'тестер*',
+      'ПЦР',
+      'литератур*',
+      'противогололедн*',
+      'выполнен* работ*',
+      'изолятор*',
+      'строительств*',
+      'выполнен* ПИР',
+      'комбинезон*',
+      'офис* крес*',
+      'техническ* сопровожден*',
+      'демонтаж*',
+      'питан* дет*',
+      'бакалейн* продукц*',
+      'печат* оборудован*',
+      'лакокрасочн*',
+      'охрана',
+      'овощ*',
+      'фрукт*',
+      'арматур*',
+      'поверочн* установ*',
+      'полиграф* продукц*',
+      'реконструк*',
+      'порт-систем*',
+      'протез*',
+      'обеспеч* безопасност*',
+      'постав* дезинф*',
+      'двигател*',
+      'мясопродукт*',
+      'размораживат*',
+      'твердосплав*',
+      'гиря',
+      'неизолированн* провод',
+      'рыбн* продукц*',
+      'осушител* воздух*',
+      'поставк* масок',
+      'мультимедийн* оборудован*',
+      'предоставлен* труд*',
+      'постав* перчаток',
+      'вод* питьев*',
+      'лабораторн* животн*',
+      'благоустройств*',
+      'ткан* материал*',
+      'строительн* товар*',
+      'строительн* материал*',
+      'металлическ*',
+      'поликарбонат*',
+      'автоматизиров* станц*',
+      'сигнальн* огонь',
+      'электротехническ*',
+      'насос',
+      'крепежн*',
+      'костюм*',
+      'плазмаферез*',
+      'холодильн* установ*',
+      'противогаз*',
+      'ремкомплект*',
+      'организац* питан*',
+      'содержан* чистот*',
+      'транспортерн* лент*',
+      'люк-лаз*',
+      'аварийн* обслуживан*',
+      'газов* баллон*',
+      'топлив*',
+      'электромонтажн* работ*',
+      'систем* вентиляц*',
+      'мяс* продукц*',
+      'благоустроенн* квартир*',
+      'приобретен* жилого',
+      'электронн* книг*',
+      'книжн* продук*',
+      'цветочн* продук*',
+      'пищеблок*',
+      'пиломатериал*',
+      'проведен* курс*',
+      'проектирован*',
+      'ветеринарн*',
+      'моющи* средств*',
+      '(АМ-900)',
+      'humastar',
+      '(иммунофлуоресцентн* анализ*)~2',
+      '(ba-400)',
+      'рефлеком',
+      'ам900',
+      '(ам 770)',
+      'ам770',
+      '(AU 480)',
+    ],
+  },
+  'гбуз "гкб им. ф.и. иноземцева дзм"': {
+    Text: ['ГБУЗ "ГКБ ИМ. Ф.И. ИНОЗЕМЦЕВА ДЗМ"'],
+    Exclude: [],
+  },
+  'ооо "виджимедик"': {
+    Text: ['ООО "ВИДЖИМЕДИК"'],
+    Exclude: [],
+  },
+  'ооо "атлантика"': {
+    Text: ['ООО "АТЛАНТИКА"'],
+    Exclude: [],
+  },
+  'ип чеботнов михаил. александрович.': {
+    Text: ['ИП ЧЕБОТНОВ МИХАИЛ. АЛЕКСАНДРОВИЧ.'],
+    Exclude: [],
+  },
+  'ип мандрыгин михаил. ефимович.': {
+    Text: ['ИП МАНДРЫГИН МИХАИЛ. ЕФИМОВИЧ.'],
+    Exclude: [],
+  },
+  'ооо гк "медес"': {
+    Text: ['ООО ГК "МЕДЕС"'],
+    Exclude: [],
+  },
+  'ип качкин роман. вячеславович.': {
+    Text: ['ИП КАЧКИН РОМАН. ВЯЧЕСЛАВОВИЧ.'],
+    Exclude: [],
+  },
+  'ооо "парамед"': {
+    Text: ['ООО "ПАРАМЕД"'],
+    Exclude: [],
+  },
+  'ооо "диалан"': {
+    Text: ['ООО "ДИАЛАН"'],
+    Exclude: [],
+  },
+  'ип шевцова екатерина. сергеевна.': {
+    Text: ['ИП ШЕВЦОВА ЕКАТЕРИНА. СЕРГЕЕВНА.'],
+    Exclude: [],
+  },
+  'ип ткачев андрей. владимирович.': {
+    Text: ['ИП ТКАЧЕВ АНДРЕЙ. ВЛАДИМИРОВИЧ.'],
+    Exclude: [],
+  },
+  'ооо "терция"': {
+    Text: ['ООО "ТЕРЦИЯ"'],
+    Exclude: [],
+  },
+  'ип подоляцкий николай. сергеевич.': {
+    Text: ['ИП ПОДОЛЯЦКИЙ НИКОЛАЙ. СЕРГЕЕВИЧ.'],
+    Exclude: [],
+  },
+  'ооо "медконто"': {
+    Text: ['ООО "МЕДКОНТО"'],
+    Exclude: [],
+  },
+  'ооо "имбиан трейд"': {
+    Text: ['ООО "ИМБИАН ТРЕЙД"'],
+    Exclude: [],
+  },
+  'ооо "гем"': {
+    Text: ['ООО "ГЕМ"'],
+    Exclude: [],
+  },
+  'ооо "альфа трейд"': {
+    Text: ['ООО "АЛЬФА ТРЕЙД"'],
+    Exclude: [],
+  },
+  'гбузрк "евпаторийская гб"': {
+    Text: ['ГБУЗРК "ЕВПАТОРИЙСКАЯ ГБ"'],
+    Exclude: [],
+  },
+  'ооо "нарколаб"': {
+    Text: ['ООО "НАРКОЛАБ"'],
+    Exclude: [],
+  },
+  'гбуз "ммкц "коммунарка" дзм"': {
+    Text: ['ГБУЗ "ММКЦ "КОММУНАРКА" ДЗМ"'],
+    Exclude: [],
+  },
+  'ао "север-юг"': {
+    Text: ['АО "СЕВЕР-ЮГ"'],
+    Exclude: [],
+  },
+  'ип вахрушева наталья. владимировна.': {
+    Text: ['ИП ВАХРУШЕВА НАТАЛЬЯ. ВЛАДИМИРОВНА.'],
+    Exclude: [],
+  },
+  'огбуз "костромской областной госпиталь для ветеранов войн"': {
+    Text: ['ОГБУЗ "КОСТРОМСКОЙ ОБЛАСТНОЙ ГОСПИТАЛЬ ДЛЯ ВЕТЕРАНОВ ВОЙН"'],
+    Exclude: [],
+  },
+  'ип лиманов артем. александрович.': {
+    Text: ['ИП ЛИМАНОВ АРТЕМ. АЛЕКСАНДРОВИЧ.'],
+    Exclude: [],
+  },
+  'ооо "медикал ресурс"': {
+    Text: ['ООО "МЕДИКАЛ РЕСУРС"'],
+    Exclude: [],
+  },
+  'гбуз "дкц № 1 дзм"': {
+    Text: ['ГБУЗ "ДКЦ № 1 ДЗМ"'],
+    Exclude: [],
+  },
+  'ип перцев дмитрий. сергеевич.': {
+    Text: ['ИП ПЕРЦЕВ ДМИТРИЙ. СЕРГЕЕВИЧ.'],
+    Exclude: [],
+  },
+  'гуз "липецкая гб № 4 "липецк- мед"': {
+    Text: ['ГУЗ "ЛИПЕЦКАЯ ГБ № 4 "ЛИПЕЦК- МЕД"'],
+    Exclude: [],
+  },
+  'ооо "фармпост"': {
+    Text: ['ООО "ФАРМПОСТ"'],
+    Exclude: [],
+  },
+  'ооо "лабмединвест"': {
+    Text: ['ООО "ЛАБМЕДИНВЕСТ"'],
+    Exclude: [],
+  },
+  'ооо "никлаб"': {
+    Text: ['ООО "НИКЛАБ"'],
+    Exclude: [],
+  },
+  'ооо "лаб-сервис"': {
+    Text: ['ООО "ЛАБ-СЕРВИС"'],
+    Exclude: [],
+  },
+  'ооо "харди"': {
+    Text: ['ООО "ХАРДИ"'],
+    Exclude: [],
+  },
+  нарколаб: {
+    Text: ['Множественные наркотики ИВД', 'Сармат*', 'Нарколаб*'],
+    Exclude: [],
+  },
+  'ип сысеева анна. сергеевна.': {
+    Text: ['ИП СЫСОЕВА АННА. СЕРГЕЕВНА.'],
+    Exclude: [],
+  },
+  'ип тужина светлана. васильевна.': {
+    Text: ['ИП ТУЖИНА СВЕТЛАНА. ВАСИЛЬЕВНА.'],
+    Exclude: [],
+  },
+  'ооо "алектест"': {
+    Text: ['ООО "АЛЕКТЕСТ"'],
+    Exclude: [],
+  },
+  бахилы: {
+    Text: ['Бахилы', 'бахил*'],
+    Exclude: [
+      'услуг*',
+      'ремонт*',
+      'посуд*',
+      'Ластик*',
+      'Метл*',
+      'уборк*',
+      'аппарат*',
+      'костыл*',
+      'гамаш*',
+      'уборк*',
+    ],
+  },
+  '=перчатки все=': {
+    Text: [
+      'стерильн* перчат*',
+      'нестерильн* перчат*',
+      'хиругич* перчат*',
+      'неопудрен* перчат*',
+      'латекс* перчат*',
+      'резин* перчат*',
+      'Перчатк* смотро*',
+      'из латекса гевеи',
+    ],
+    Exclude: [
+      'х/б',
+      'чистящ*',
+      'моющ*',
+      'бытов*',
+      'ремонт*',
+      'обслуж*',
+      'продукт* питан*',
+      'Техническом* обслуживан*',
+      'ламп*',
+      'спецо*',
+      'диэлектри*',
+      'очки',
+      'хозяйств*',
+      'подгуз*',
+      'сапог*',
+      'ботинк*',
+      'Перчатк* резин* техническ*',
+      'посуд*',
+      'респират*',
+      'для волос',
+      'Шампунь',
+      'Кондиционер',
+      'трикотажн*',
+      'Вакцин*',
+      'ветеринар*',
+      'Пеленк*',
+      'общего назначен*',
+    ],
+  },
+  'перчатки юфо + кемерово + пфо': {
+    Text: [
+      'стерильн* перчат*',
+      'нестерильн* перчат*',
+      'хиругич* перчат*',
+      'неопудрен* перчат*',
+      'латекс* перчат*',
+      'резин* перчат*',
+      'Перчатк* смотро*',
+      'из латекса гевеи',
+    ],
+    Exclude: [
+      'х/б',
+      'чистящ*',
+      'моющ*',
+      'бытов*',
+      'ремонт*',
+      'обслуж*',
+      'продукт* питан*',
+      'Техническом* обслуживан*',
+      'ламп*',
+      'спецо*',
+      'диэлектри*',
+      'очки',
+      'хозяйств*',
+      'подгуз*',
+      'сапог*',
+      'ботинк*',
+      'Перчатк* резин* техническ*',
+      'посуд*',
+      'респират*',
+      'для волос',
+      'Шампунь',
+      'Кондиционер',
+      'трикотажн*',
+      'Вакцин*',
+      'ветеринар*',
+      'Пеленк*',
+      'общего назначен*',
+    ],
+  },
+  'ланцеты+stix': {
+    Text: [
+      'Ланцет для ручного прокалывания',
+      'ланцет*',
+      'скарификатор*',
+      'Clinitek Status',
+      'Клинитек*',
+      'Клинитэк Статус',
+      'Клинитек Статус',
+      'тест-полоск* для анализатор* мочи Clinitek',
+    ],
+    Exclude: [
+      'х/б',
+      'чистящ*',
+      'моющ*',
+      'бытов*',
+      'ремонт*',
+      'обслуж*',
+      'продукт* питан*',
+      'Техническом* обслуживан*',
+      'ламп*',
+      'Лекарственн* препарат*',
+      'Лекарственн* средств*',
+      'Стетофонендоскоп*',
+      'Носилк* мягки*',
+      'Поставк* сельскохозяйственн* оборудован*',
+      'борон* дисков*',
+      'Вакуумн* матрас*',
+      'Ведр* с педальн* крышк*',
+      'Пиридоксин*',
+      'Корцанг*',
+      'КАЛЬЦИ* ГЛЮКОНАТ*',
+      'АМИНОФИЛЛИН*',
+      'ТИАМИН8',
+      'АКТИВИРОВАН* УГОЛ*',
+      'МЕТИЛПРЕДНИЗОЛОН*',
+      'ДОКСОРУБИЦИН*',
+      'ЦЕФТАЗИДИМ*',
+      'Дождевател* качающи*',
+      'Оборудование для обработки почвы',
+    ],
+  },
+  'гбуз "мнпц наркологии дзм"': {
+    Text: ['ГБУЗ "МНПЦ НАРКОЛОГИИ ДЗМ"'],
+    Exclude: [],
+  },
+  'ип краснощек ольга валентиновна': {
+    Text: ['ИП КРАСНОЩЕК ОЛЬГА ВАЛЕНТИНОВНА'],
+    Exclude: [],
+  },
+}
+
+function enrichTenderKey(key: { _id: string; name: string }): { _id: string; name: string; Text: string[]; Exclude: string[] } {
+  const enrichment = TENDER_KEY_ENRICHMENTS[key.name.trim().toLowerCase()]
+  return {
+    ...key,
+    Text: enrichment?.Text ?? [],
+    Exclude: enrichment?.Exclude ?? [],
+  }
+}
+
+function parseStringArrayQuery(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((x) => String(x).trim()).filter((x) => x.length > 0)
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    return [value.trim()]
+  }
+  return []
+}
+
+function formatDateYmd(date: Date): string {
+  const y = date.getFullYear()
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+function konturSearchDateRange(days = 20): { DateTimeFrom: string; DateTimeTo: string } {
+  const to = new Date()
+  const from = new Date()
+  from.setDate(to.getDate() - (days - 1))
+  return { DateTimeFrom: formatDateYmd(from), DateTimeTo: formatDateYmd(to) }
+}
+
+type KonturSearchParams = {
+  apiKey: string
+  dateTimeFrom: string
+  dateTimeTo: string
+  text: string[]
+  exclude: string[]
+  attachments: boolean
+}
+
+async function fetchKonturSearchAllPages(params: KonturSearchParams): Promise<{
+  TotalCount: number
+  Items: unknown[]
+  PageNumber: number
+}> {
+  const url = new URL('https://api-zakupki.kontur.ru/external/v1/search')
+  url.searchParams.set('DateTimeFrom', params.dateTimeFrom)
+  url.searchParams.set('DateTimeTo', params.dateTimeTo)
+
+  const baseBody = {
+    DateTimeFrom: params.dateTimeFrom,
+    DateTimeTo: params.dateTimeTo,
+    Text: params.text,
+    Exclude: params.exclude,
+    Attachments: params.attachments,
+  }
+
+  const allItems: unknown[] = []
+  let totalCount = 0
+  let pageNumber = 0
+
+  while (true) {
+    const upstream = await fetch(url.toString(), {
+      method: 'POST',
+      headers: {
+        'X-Kontur-Apikey': params.apiKey,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ ...baseBody, PageNumber: pageNumber }),
+      signal: AbortSignal.timeout(30000),
+    })
+
+    const json = (await upstream.json().catch(() => null)) as Record<string, unknown> | null
+    if (!upstream.ok) {
+      const err = new Error(`Kontur API error: ${upstream.status}`) as Error & { details?: unknown }
+      err.details = json
+      throw err
+    }
+
+    totalCount = Number(json?.TotalCount ?? 0)
+    const pageItems = Array.isArray(json?.Items) ? json.Items : []
+    allItems.push(...pageItems)
+
+    if (pageItems.length === 0 || allItems.length >= totalCount) break
+    pageNumber += 1
+  }
+
+  return { TotalCount: totalCount, Items: allItems, PageNumber: pageNumber }
+}
+
+async function fetchKonturPurchaseById(apiKey: string, purchaseId: string): Promise<Record<string, unknown>> {
+  const upstream = await fetch(`https://api-zakupki.kontur.ru/external/v1/purchases/${encodeURIComponent(purchaseId)}`, {
+    headers: {
+      'X-Kontur-Apikey': apiKey,
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(60000),
+  })
+
+  const json = (await upstream.json().catch(() => null)) as Record<string, unknown> | null
+  if (!upstream.ok) {
+    const err = new Error(`Kontur API error: ${upstream.status}`) as Error & { details?: unknown }
+    err.details = json
+    throw err
+  }
+
+  return json ?? {}
+}
+
+function getBicotenderCredentials(): { login: string; password: string } | null {
+  const login = asNonEmptyString(process.env.BICOTENDER_LOGIN)
+  const password = asNonEmptyString(process.env.BICOTENDER_PASSWORD)
+  if (!login || !password) return null
+  return { login, password }
+}
+
+async function fetchBicotenderTenders(params: {
+  login: string
+  password: string
+  keywords: string[]
+  nokeywords: string[]
+}): Promise<Record<string, unknown>> {
+  const url = new URL('https://www.bicotender.ru/api3/tenders/')
+  url.searchParams.set('login', params.login)
+  url.searchParams.set('password', params.password)
+  for (const keyword of params.keywords) url.searchParams.append('keywords', keyword)
+  for (const nokeyword of params.nokeywords) url.searchParams.append('nokeywords', nokeyword)
+
+  const upstream = await fetch(url.toString(), {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(60000),
+  })
+
+  const json = (await upstream.json().catch(() => null)) as Record<string, unknown> | null
+  if (!upstream.ok) {
+    const err = new Error(`Bicotender API error: ${upstream.status}`) as Error & { details?: unknown }
+    err.details = json
+    throw err
+  }
+
+  return json ?? {}
+}
+
+async function fetchBicotenderTenderById(tenderId: string): Promise<Record<string, unknown>> {
+  const creds = getBicotenderCredentials()
+  if (!creds) throw new Error('BICOTENDER_LOGIN and BICOTENDER_PASSWORD are not configured')
+
+  const url = new URL(`https://www.bicotender.ru/api3/tenders/${encodeURIComponent(tenderId)}`)
+  url.searchParams.set('login', creds.login)
+  url.searchParams.set('password', creds.password)
+
+  const upstream = await fetch(url.toString(), {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(60000),
+  })
+
+  const json = (await upstream.json().catch(() => null)) as Record<string, unknown> | null
+  if (!upstream.ok) {
+    const err = new Error(`Bicotender API error: ${upstream.status}`) as Error & { details?: unknown }
+    err.details = json
+    throw err
+  }
+
+  return json ?? {}
+}
+
+async function resolveTenderKeyEnrichmentById(keyId: string): Promise<{ Text: string[]; Exclude: string[] }> {
+  const token =
+    process.env.TENDERPLAN_API_TOKEN ??
+    'f6cf879e0113dc709cb929e4281a9f54b21a5ef6b3e4190523837650d2c1e0995ad31d17524739a5c011c7b0255e33e994daee02249d6eb4a530e22132bc2116'
+
+  const upstream = await fetch('https://tenderplan.ru/api/keys/getall', {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    signal: AbortSignal.timeout(15000),
+  })
+
+  const json = await upstream.json().catch(() => null)
+  if (!upstream.ok) {
+    return { Text: [], Exclude: [] }
+  }
+
+  const rawList = Array.isArray(json) ? json : Array.isArray((json as any)?.data) ? (json as any).data : []
+  const key = rawList.find((x: any) => String(x?._id ?? '') === keyId)
+  if (!key || typeof key?.name !== 'string') {
+    return { Text: [], Exclude: [] }
+  }
+
+  const enriched = enrichTenderKey({ _id: String(key._id), name: String(key.name) })
+  return { Text: enriched.Text, Exclude: enriched.Exclude }
+}
+
+type MatchNotificationPayload = {
+  auctionNumber: string | null
+  customerName: string | null
+  customerInn: string | null
+  auctionPrice: number | null
+  sourceUrl: string | null
+  decision: JudgeDecision
+  uploadedFilename: string
+  bestMatchFilename: string | null
+  matchedCount: number
+  totalCount: number
+  matchPercent: number
+}
+
+function asNonEmptyString(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+function asNullableNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function extractTenderMetaFromResponse(json: any): {
+  auctionNumber: string | null
+  customerName: string | null
+  customerInn: string | null
+} {
+  const auctionNumber =
+    asNonEmptyString(json?.auctionNumber) ??
+    asNonEmptyString(json?.purchaseNumber) ??
+    asNonEmptyString(json?.number) ??
+    asNonEmptyString(json?.registryNumber) ??
+    asNonEmptyString(json?.data?.auctionNumber) ??
+    asNonEmptyString(json?.data?.purchaseNumber) ??
+    asNonEmptyString(json?.data?.number) ??
+    asNonEmptyString(json?.data?.registryNumber)
+
+  const customerName =
+    asNonEmptyString(json?.customerName) ??
+    asNonEmptyString(json?.customer?.name) ??
+    asNonEmptyString(json?.customer?.fullName) ??
+    asNonEmptyString(json?.customer?.title) ??
+    asNonEmptyString(json?.data?.customerName) ??
+    asNonEmptyString(json?.data?.customer?.name) ??
+    asNonEmptyString(json?.data?.customer?.fullName) ??
+    asNonEmptyString(json?.data?.customer?.title)
+
+  const customerInn =
+    asNonEmptyString(json?.customerInn) ??
+    asNonEmptyString(json?.customer?.inn) ??
+    asNonEmptyString(json?.inn) ??
+    asNonEmptyString(json?.data?.customerInn) ??
+    asNonEmptyString(json?.data?.customer?.inn) ??
+    asNonEmptyString(json?.data?.inn)
+
+  return { auctionNumber, customerName, customerInn }
+}
+
+async function sendMatchNotificationEmail(payload: MatchNotificationPayload): Promise<{
+  sent: boolean
+  reason?: string
+  messageId?: string
+  accepted?: string[]
+  rejected?: string[]
+  response?: string
+}> {
+  const smtpHost = asNonEmptyString(process.env.SMTP_HOST)
+  const smtpPort = asNullableNumber(process.env.SMTP_PORT)
+  const smtpUser = asNonEmptyString(process.env.SMTP_USER)
+  const smtpPass = asNonEmptyString(process.env.SMTP_PASS)
+  const smtpFrom = asNonEmptyString(process.env.SMTP_FROM) ?? smtpUser
+
+  if (!smtpHost || !smtpPort || !smtpUser || !smtpPass || !smtpFrom) {
+    return { sent: false, reason: 'SMTP is not configured' }
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpPort === 465,
+      auth: {
+        user: smtpUser,
+        pass: smtpPass,
+      },
+    })
+
+    const auctionPriceText =
+      typeof payload.auctionPrice === 'number' && Number.isFinite(payload.auctionPrice)
+        ? `${new Intl.NumberFormat('ru-RU').format(payload.auctionPrice)} ₽`
+        : 'не указана'
+
+    const lines = [
+      'Сопоставление файлов завершено.',
+      '',
+      `Статус: ${payload.decision === 'match' ? 'соответствует' : 'не соответствует'}`,
+      `Файл аукциона: ${payload.uploadedFilename}`,
+      `Лучшее совпадение: ${payload.bestMatchFilename ?? 'не найдено'}`,
+      `Процент совпадения: ${payload.matchPercent.toFixed(1)}%`,
+      `Совпавших критериев: ${payload.matchedCount}/${payload.totalCount}`,
+      '',
+      `Номер аукциона: ${payload.auctionNumber ?? 'не указан'}`,
+      `Заказчик: ${payload.customerName ?? 'не указан'}`,
+      `ИНН заказчика: ${payload.customerInn ?? 'не указан'}`,
+      `Цена аукциона: ${auctionPriceText}`,
+      `Ссылка: ${payload.sourceUrl ?? 'не указана'}`,
+    ]
+
+    const info = await transporter.sendMail({
+      from: smtpFrom,
+      to: MATCH_NOTIFY_EMAIL,
+      subject: `${payload.auctionNumber ?? 'Без номера аукциона'}`,
+      text: lines.join('\n'),
+    })
+    return {
+      sent: true,
+      messageId: info.messageId,
+      accepted: Array.isArray(info.accepted) ? info.accepted.map((x) => String(x)) : [],
+      rejected: Array.isArray(info.rejected) ? info.rejected.map((x) => String(x)) : [],
+      response: typeof info.response === 'string' ? info.response : undefined,
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    return { sent: false, reason: message }
+  }
+}
+
+app.post('/api/test-email', async (_req, res) => {
+  try {
+    const result = await sendMatchNotificationEmail({
+      auctionNumber: 'TEST-0001',
+      customerName: 'Тестовый заказчик',
+      customerInn: '0000000000',
+      auctionPrice: 123456,
+      sourceUrl: 'https://example.com/test',
+      decision: 'match',
+      uploadedFilename: 'test-file.docx',
+      bestMatchFilename: 'library-test.docx',
+      matchedCount: 3,
+      totalCount: 5,
+      matchPercent: 60,
+    })
+    if (!result.sent) {
+      return res.status(500).json({ ok: false, ...result })
+    }
+    res.json({ ok: true, ...result })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    res.status(500).json({ ok: false, sent: false, reason: message })
+  }
+})
 
 function productNameHintFromFilename(filename: string): string | null {
   const base = path.basename(filename, path.extname(filename))
@@ -274,7 +1690,7 @@ app.get('/api/tender-keys', async (_req, res) => {
     const rawList = Array.isArray(json) ? json : Array.isArray((json as any)?.data) ? (json as any).data : []
     const list = rawList
       .filter((x: any) => typeof x?._id === 'string' && typeof x?.name === 'string')
-      .map((x: any) => ({ _id: String(x._id), name: String(x.name) }))
+      .map((x: any) => enrichTenderKey({ _id: String(x._id), name: String(x.name) }))
 
     res.json({ ok: true, keys: list })
   } catch (e) {
@@ -330,7 +1746,151 @@ app.get('/api/tender-tenders', async (req, res) => {
   }
 })
 
-app.get('/api/tender-item', async (req, res) => {
+app.get('/api/kontur/search', async (req, res) => {
+  try {
+    const apiKey = asNonEmptyString(process.env.KONTUR_API_KEY)
+    if (!apiKey) return res.status(500).json({ error: 'KONTUR_API_KEY is not configured' })
+
+    const defaultDates = konturSearchDateRange()
+    const dateTimeFrom = String(req.query.DateTimeFrom ?? defaultDates.DateTimeFrom)
+    const dateTimeTo = String(req.query.DateTimeTo ?? defaultDates.DateTimeTo)
+    let text = parseStringArrayQuery(req.query.Text)
+    let exclude = parseStringArrayQuery(req.query.Exclude)
+
+    const keyId = asNonEmptyString(req.query.keyId ?? req.query.key)
+    if (keyId && text.length === 0 && exclude.length === 0) {
+      const enrichment = await resolveTenderKeyEnrichmentById(keyId)
+      text = enrichment.Text
+      exclude = enrichment.Exclude
+    }
+
+    const attachments = req.query.Attachments !== 'false'
+
+    const json = await fetchKonturSearchAllPages({
+      apiKey,
+      dateTimeFrom,
+      dateTimeTo,
+      text,
+      exclude,
+      attachments,
+    })
+
+    res.json({ ok: true, result: json, Text: text, Exclude: exclude, Attachments: attachments })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    const details = e && typeof e === 'object' && 'details' in e ? (e as { details?: unknown }).details : undefined
+    if (message.startsWith('Kontur API error:')) {
+      return res.status(502).json({ error: message, details })
+    }
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/kontur/purchases/get', async (req, res) => {
+  try {
+    const apiKey = asNonEmptyString(process.env.KONTUR_API_KEY)
+    if (!apiKey) return res.status(500).json({ error: 'KONTUR_API_KEY is not configured' })
+
+    const purchaseId = String(req.query.id ?? req.query.purchaseId ?? '').trim()
+    if (!purchaseId) return res.status(400).json({ error: 'Missing id query param' })
+
+    const result = await fetchKonturPurchaseById(apiKey, purchaseId)
+    res.json({ ok: true, result })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    const details = e && typeof e === 'object' && 'details' in e ? (e as { details?: unknown }).details : undefined
+    if (message.startsWith('Kontur API error:')) {
+      return res.status(502).json({ error: message, details })
+    }
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/bicotender/tenders/get', async (req, res) => {
+  try {
+    const tenderId = String(req.query.tender_id ?? req.query.id ?? '').trim()
+    if (!tenderId) return res.status(400).json({ error: 'Missing tender_id query param' })
+
+    const result = await fetchBicotenderTenderById(tenderId)
+    res.json({ ok: true, result })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    const details = e && typeof e === 'object' && 'details' in e ? (e as { details?: unknown }).details : undefined
+    if (message.startsWith('Bicotender API error:')) {
+      return res.status(502).json({ error: message, details })
+    }
+    if (message.includes('not configured')) {
+      return res.status(500).json({ error: message })
+    }
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/bicotender/tenders', async (req, res) => {
+  try {
+    const creds = getBicotenderCredentials()
+    if (!creds) {
+      return res.status(500).json({ error: 'BICOTENDER_LOGIN and BICOTENDER_PASSWORD are not configured' })
+    }
+    const { login, password } = creds
+
+    let keywords = parseStringArrayQuery(req.query.keywords)
+    let nokeywords = parseStringArrayQuery(req.query.nokeywords)
+    if (keywords.length === 0) keywords = parseStringArrayQuery(req.query.Text)
+    if (nokeywords.length === 0) nokeywords = parseStringArrayQuery(req.query.Exclude)
+
+    const keyId = asNonEmptyString(req.query.keyId ?? req.query.key)
+    if (keyId && keywords.length === 0 && nokeywords.length === 0) {
+      const enrichment = await resolveTenderKeyEnrichmentById(keyId)
+      keywords = enrichment.Text
+      nokeywords = enrichment.Exclude
+    }
+
+    const result = await fetchBicotenderTenders({ login, password, keywords, nokeywords })
+
+    res.json({ ok: true, result, keywords, nokeywords })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    const details = e && typeof e === 'object' && 'details' in e ? (e as { details?: unknown }).details : undefined
+    if (message.startsWith('Bicotender API error:')) {
+      return res.status(502).json({ error: message, details })
+    }
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/bicotender/attachment', async (req, res) => {
+  try {
+    const href = String(req.query.href ?? '').trim()
+    const realName = String(req.query.realName ?? 'attachment').trim() || 'attachment'
+    if (!href) return res.status(400).json({ error: 'Missing href query param' })
+
+    const downloadUrl = new URL(href)
+    if (!/^https?:$/.test(downloadUrl.protocol)) {
+      return res.status(400).json({ error: 'Invalid href protocol' })
+    }
+
+    const upstream = await fetch(downloadUrl.toString(), {
+      signal: AbortSignal.timeout(60000),
+    })
+
+    if (!upstream.ok) {
+      return res.status(502).json({ error: `Attachment download failed: ${upstream.status}` })
+    }
+
+    const contentType = upstream.headers.get('content-type') ?? 'application/octet-stream'
+    const data = Buffer.from(await upstream.arrayBuffer())
+
+    res.setHeader('Content-Type', contentType)
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(realName)}`)
+    res.send(data)
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/tenders/get', async (req, res) => {
   try {
     const id = String(req.query.id ?? '').trim()
     if (!id) return res.status(400).json({ error: 'Missing id query param' })
@@ -365,6 +1925,7 @@ app.get('/api/tender-item', async (req, res) => {
     const maxPriceRaw = (json as any)?.maxPrice ?? (json as any)?.data?.maxPrice ?? null
     const hrefRaw = (json as any)?.href ?? (json as any)?.data?.href ?? null
 
+    const tenderMeta = extractTenderMetaFromResponse(json)
     const attachments = rawAttachments
       .filter((x: any) => typeof x?.href === 'string' || typeof x?.realName === 'string')
       .map((x: any) => ({
@@ -372,11 +1933,56 @@ app.get('/api/tender-item', async (req, res) => {
         href: String(x?.href ?? ''),
       }))
 
+    const upstreamObject = json && typeof json === 'object' && !Array.isArray(json) ? (json as Record<string, unknown>) : {}
     res.json({
+      ...upstreamObject,
       ok: true,
       href: typeof hrefRaw === 'string' ? hrefRaw : null,
       maxPrice: typeof maxPriceRaw === 'number' ? maxPriceRaw : Number.isFinite(Number(maxPriceRaw)) ? Number(maxPriceRaw) : null,
+      auctionNumber: tenderMeta.auctionNumber,
+      customerName: tenderMeta.customerName,
+      customerInn: tenderMeta.customerInn,
       attachments,
+      rawUpstream: json,
+    })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/organizations/get', async (req, res) => {
+  try {
+    const id = String(req.query.id ?? '').trim()
+    if (!id) return res.status(400).json({ error: 'Missing id query param' })
+
+    const token =
+      process.env.TENDERPLAN_API_TOKEN ??
+      'f6cf879e0113dc709cb929e4281a9f54b21a5ef6b3e4190523837650d2c1e0995ad31d17524739a5c011c7b0255e33e994daee02249d6eb4a530e22132bc2116'
+
+    const url = new URL('https://tenderplan.ru/api/organizations/get')
+    url.searchParams.set('id', id)
+
+    const upstream = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+      signal: AbortSignal.timeout(20000),
+    })
+
+    const json = await upstream.json().catch(() => null)
+    if (!upstream.ok) {
+      return res.status(502).json({
+        error: `TenderPlan API error: ${upstream.status}`,
+        details: json,
+      })
+    }
+
+    const upstreamObject = json && typeof json === 'object' && !Array.isArray(json) ? (json as Record<string, unknown>) : {}
+    res.json({
+      ...upstreamObject,
+      ok: true,
+      rawUpstream: json,
     })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
@@ -603,6 +2209,11 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     const clientFilename = typeof req.body?.clientFilename === 'string' ? req.body.clientFilename : null
     const originalFilename = clientFilename ?? f.originalname
     const fixedFilename = restoreUtf8FromLatin1(originalFilename)
+    const auctionNumber = asNonEmptyString(req.body?.auctionNumber)
+    const customerName = asNonEmptyString(req.body?.customerName)
+    const customerInn = asNonEmptyString(req.body?.customerInn)
+    const auctionPrice = asNullableNumber(req.body?.auctionPrice)
+    const sourceUrl = asNonEmptyString(req.body?.sourceUrl)
     const extension = safeExtension(fixedFilename)
     if (!['.pdf', '.doc', '.docx', '.xlsx', '.xls'].includes(extension)) {
       return res.status(400).json({ error: 'Unsupported file type' })
@@ -1193,6 +2804,22 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         ? 'match'
         : decision
     const matchPercentOut = rawMatchPercentOut
+    const emailNotification =
+      decisionOut === 'match'
+        ? await sendMatchNotificationEmail({
+            auctionNumber,
+            customerName,
+            customerInn,
+            auctionPrice,
+            sourceUrl,
+            decision: decisionOut,
+            uploadedFilename: fixedFilename,
+            bestMatchFilename: selected.doc?.originalFilename ?? null,
+            matchedCount: matchedCountOut,
+            totalCount: selected.totalCount,
+            matchPercent: matchPercentOut,
+          })
+        : { sent: false, reason: 'Skipped: decision is no_match' }
 
     res.json({
       ok: true,
@@ -1218,6 +2845,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
       llmExplanation:
         llm?.explanation && llm.explanation.trim().length > 0 ? llm.explanation : llmError ?? null,
       analyzerInfo,
+      emailNotification,
       // We return only the best matching document.
       matches:
         decisionOut === 'match'

@@ -355,6 +355,16 @@ body {
   border-color: #d7e4f3;
 }
 
+.ms-card--kontur {
+  border: 2px solid #d93025;
+  border-color: #d93025;
+}
+
+.ms-card--bicotender {
+  border: 2px solid #f57c00;
+  border-color: #f57c00;
+}
+
 .ms-card-button {
   width: 100%;
   text-align: left;

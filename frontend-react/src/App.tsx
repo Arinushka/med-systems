@@ -1,5 +1,19 @@
 import { useEffect, useState } from 'react'
 
+function formatDateYmd(date: Date): string {
+  const y = date.getFullYear()
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+function konturSearchDateRange(days = 20): { DateTimeFrom: string; DateTimeTo: string } {
+  const to = new Date()
+  const from = new Date()
+  from.setDate(to.getDate() - (days - 1))
+  return { DateTimeFrom: formatDateYmd(from), DateTimeTo: formatDateYmd(to) }
+}
+
 type LibraryDoc = {
   id: string
   originalFilename: string
@@ -33,9 +47,16 @@ type AnalyzerInfo = {
   analyzers: string[]
 }
 
+type EmailNotification = {
+  sent: boolean
+  reason?: string
+}
+
 type TenderKey = {
   _id: string
   name: string
+  Text?: string[]
+  Exclude?: string[]
 }
 
 type TenderListItem = {
@@ -43,11 +64,116 @@ type TenderListItem = {
   orderName: string
   href?: string | null
   maxPrice?: number | null
+  auctionNumber?: string | null
+  customerName?: string | null
+  customerInn?: string | null
 }
 
 type TenderAttachmentItem = {
   realName: string
   href: string
+  source?: 'tenderplan' | 'bicotender' | 'kontur'
+}
+
+type TenderMetaForMatch = {
+  auctionNumber: string | null
+  customerName: string | null
+  customerInn: string | null
+  maxPrice: number | null
+  sourceUrl: string | null
+}
+
+type KonturListItem = {
+  id: string
+  orderName: string
+  link: string | null
+  maxPrice: number | null
+}
+
+function parseKonturItems(raw: unknown): KonturListItem[] {
+  const result = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null
+  const items = Array.isArray(result?.Items) ? result.Items : []
+  return items.map((x: any, idx: number) => ({
+    id: String(x?.Id ?? x?.id ?? x?.Guid ?? x?.guid ?? idx),
+    orderName: String(x?.OrderName ?? x?.orderName ?? ''),
+    link: typeof (x?.Link ?? x?.link) === 'string' ? String(x?.Link ?? x?.link) : null,
+    maxPrice:
+      typeof (x?.MaxPrice ?? x?.maxPrice) === 'number'
+        ? (x?.MaxPrice ?? x?.maxPrice)
+        : Number.isFinite(Number(x?.MaxPrice ?? x?.maxPrice))
+          ? Number(x?.MaxPrice ?? x?.maxPrice)
+          : null,
+  }))
+}
+
+function konturAttachmentsFromPurchase(detail: Record<string, unknown>): TenderAttachmentItem[] {
+  const docs = Array.isArray(detail.Docs) ? detail.Docs : []
+  return docs
+    .filter((x: any) => typeof x?.Url === 'string' && String(x.Url).trim().length > 0)
+    .map((x: any) => ({
+      href: String(x.Url),
+      realName: String(x?.FileName ?? ''),
+      source: 'kontur' as const,
+    }))
+}
+
+function konturMetaFromPurchase(item: KonturListItem, detail: Record<string, unknown>): TenderMetaForMatch {
+  const organizer = detail.Organizer && typeof detail.Organizer === 'object' ? detail.Organizer : null
+  const initialSum = detail.InitialSum && typeof detail.InitialSum === 'object' ? detail.InitialSum : null
+  return {
+    customerName:
+      organizer && typeof (organizer as any).FullName === 'string' ? String((organizer as any).FullName) : null,
+    customerInn: organizer && typeof (organizer as any).Inn === 'string' ? String((organizer as any).Inn) : null,
+    auctionNumber:
+      typeof detail.NotificationNumber === 'string' ? detail.NotificationNumber : item.id,
+    maxPrice:
+      initialSum && Number.isFinite(Number((initialSum as any).Price))
+        ? Number((initialSum as any).Price)
+        : item.maxPrice,
+    sourceUrl:
+      typeof detail.EtpLink === 'string'
+        ? detail.EtpLink
+        : typeof detail.Link === 'string'
+          ? detail.Link
+          : item.link,
+  }
+}
+
+type BicotenderListItem = {
+  id: string
+  name: string
+  cost: number | null
+}
+
+function parseBicotenderItems(raw: unknown): BicotenderListItem[] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return []
+  return Object.values(raw as Record<string, unknown>).map((x: any, idx: number) => ({
+    id: String(x?.tender_id ?? idx),
+    name: String(x?.name ?? ''),
+    cost: Number.isFinite(Number(x?.cost)) ? Number(x?.cost) : null,
+  }))
+}
+
+function bicotenderAttachmentsFromDetail(detail: Record<string, unknown>): TenderAttachmentItem[] {
+  const filesRaw = detail.files && typeof detail.files === 'object' ? detail.files : {}
+  return Object.values(filesRaw as Record<string, unknown>)
+    .filter((x: any) => typeof x?.sourceUrl === 'string' && String(x.sourceUrl).trim().length > 0)
+    .map((x: any) => ({
+      href: String(x.sourceUrl),
+      realName: String(x?.name ?? ''),
+      source: 'bicotender' as const,
+    }))
+}
+
+function bicotenderMetaFromDetail(item: BicotenderListItem, detail: Record<string, unknown>): TenderMetaForMatch {
+  const company = detail.company && typeof detail.company === 'object' ? detail.company : null
+  return {
+    customerName: company && typeof (company as any).name === 'string' ? String((company as any).name) : null,
+    customerInn: company && typeof (company as any).inn === 'string' ? String((company as any).inn) : null,
+    auctionNumber: typeof detail.srcNoticeNumber === 'string' ? detail.srcNoticeNumber : item.id,
+    maxPrice: Number.isFinite(Number(detail.cost)) ? Number(detail.cost) : item.cost,
+    sourceUrl: typeof detail.sourceUrl === 'string' ? detail.sourceUrl : null,
+  }
 }
 
 async function uploadFile(endpoint: string, file: File, extraFields?: Record<string, string>): Promise<any> {
@@ -84,6 +210,7 @@ export default function App() {
   const [rowResults, setRowResults] = useState<RowResult[]>([])
   const [llmExplanation, setLlmExplanation] = useState<string | null>(null)
   const [analyzerInfo, setAnalyzerInfo] = useState<AnalyzerInfo | null>(null)
+  const [emailNotification, setEmailNotification] = useState<EmailNotification | null>(null)
   const [tenderKeys, setTenderKeys] = useState<TenderKey[]>([])
   const [selectedTenderKeyId, setSelectedTenderKeyId] = useState<string>('')
   const [tenderKeysError, setTenderKeysError] = useState<string>('')
@@ -91,10 +218,15 @@ export default function App() {
   const [tenderItemsError, setTenderItemsError] = useState<string>('')
   const [tenderAttachments, setTenderAttachments] = useState<TenderAttachmentItem[]>([])
   const [tenderAttachmentsError, setTenderAttachmentsError] = useState<string>('')
+  const [konturItems, setKonturItems] = useState<KonturListItem[]>([])
+  const [konturSearchError, setKonturSearchError] = useState<string>('')
+  const [bicotenderItems, setBicotenderItems] = useState<BicotenderListItem[]>([])
+  const [bicotenderError, setBicotenderError] = useState<string>('')
   const [isTenderModalOpen, setIsTenderModalOpen] = useState(false)
   const [isTenderItemsLoading, setIsTenderItemsLoading] = useState(false)
   const [isAttachmentLoading, setIsAttachmentLoading] = useState(false)
   const [selectedRemoteFilename, setSelectedRemoteFilename] = useState<string>('')
+  const [selectedTenderMeta, setSelectedTenderMeta] = useState<TenderMetaForMatch | null>(null)
   const [tenderModalStep, setTenderModalStep] = useState<'tenders' | 'attachments'>('tenders')
   const [minCriteriaIfNameMatched, setMinCriteriaIfNameMatched] = useState(2)
   const minC = minCriteriaIfNameMatched
@@ -150,14 +282,23 @@ export default function App() {
         setTenderItemsError('')
         setTenderAttachments([])
         setTenderAttachmentsError('')
+        setKonturItems([])
+        setKonturSearchError('')
+        setBicotenderItems([])
+        setBicotenderError('')
         setTenderModalStep('tenders')
         setIsTenderModalOpen(false)
+        setSelectedTenderMeta(null)
         return
       }
       setIsTenderItemsLoading(true)
       setTenderItemsError('')
       setTenderAttachments([])
       setTenderAttachmentsError('')
+      setKonturItems([])
+      setKonturSearchError('')
+      setBicotenderItems([])
+      setBicotenderError('')
       setTenderModalStep('tenders')
       try {
         const resp = await fetch(`/api/tender-tenders?key=${encodeURIComponent(selectedTenderKeyId)}`)
@@ -170,7 +311,7 @@ export default function App() {
         const details = await Promise.all(
           list.map(async (item) => {
             try {
-              const dResp = await fetch(`/api/tender-item?id=${encodeURIComponent(item._id)}`)
+              const dResp = await fetch(`/api/tenders/get?id=${encodeURIComponent(item._id)}`)
               const dJson = await dResp.json().catch(() => null)
               if (!dResp.ok) return item
               return {
@@ -182,6 +323,7 @@ export default function App() {
                     : Number.isFinite(Number(dJson?.maxPrice))
                       ? Number(dJson.maxPrice)
                       : null,
+                auctionNumber: typeof dJson?.auctionNumber === 'string' ? dJson.auctionNumber : null,
               }
             } catch {
               return item
@@ -189,6 +331,44 @@ export default function App() {
           }),
         )
         setTenderItems(details)
+
+        // Kontur Zakupki external search (server-side proxy).
+        try {
+          const selectedKey = tenderKeys.find((k) => k._id === selectedTenderKeyId)
+          const konturParams = new URLSearchParams({
+            ...konturSearchDateRange(),
+            keyId: selectedTenderKeyId,
+            Attachments: 'true',
+          })
+          for (const t of selectedKey?.Text ?? []) konturParams.append('Text', t)
+          for (const e of selectedKey?.Exclude ?? []) konturParams.append('Exclude', e)
+          const kResp = await fetch(`/api/kontur/search?${konturParams.toString()}`)
+          const kJson = await kResp.json().catch(() => null)
+          if (kResp.ok) {
+            setKonturItems(parseKonturItems(kJson?.result ?? kJson))
+          } else {
+            setKonturSearchError(kJson?.error ?? `Kontur request failed: ${kResp.status}`)
+          }
+        } catch (e) {
+          setKonturSearchError(e instanceof Error ? e.message : String(e))
+        }
+
+        // Bicotender external search (server-side proxy).
+        try {
+          const selectedKey = tenderKeys.find((k) => k._id === selectedTenderKeyId)
+          const bicotenderParams = new URLSearchParams({ keyId: selectedTenderKeyId })
+          for (const t of selectedKey?.Text ?? []) bicotenderParams.append('keywords', t)
+          for (const e of selectedKey?.Exclude ?? []) bicotenderParams.append('nokeywords', e)
+          const bResp = await fetch(`/api/bicotender/tenders?${bicotenderParams.toString()}`)
+          const bJson = await bResp.json().catch(() => null)
+          if (bResp.ok) {
+            setBicotenderItems(parseBicotenderItems(bJson?.result ?? bJson))
+          } else {
+            setBicotenderError(bJson?.error ?? `Bicotender request failed: ${bResp.status}`)
+          }
+        } catch (e) {
+          setBicotenderError(e instanceof Error ? e.message : String(e))
+        }
       } catch (e) {
         setTenderItems([])
         setTenderItemsError(e instanceof Error ? e.message : 'Не удалось загрузить элементы.')
@@ -211,7 +391,12 @@ export default function App() {
         const list = Array.isArray(rawList)
           ? rawList
               .filter((x: any) => typeof x?._id === 'string' && typeof x?.name === 'string')
-              .map((x: any) => ({ _id: x._id as string, name: x.name as string }))
+              .map((x: any) => ({
+                _id: x._id as string,
+                name: x.name as string,
+                Text: Array.isArray(x?.Text) ? x.Text.map((v: unknown) => String(v)) : [],
+                Exclude: Array.isArray(x?.Exclude) ? x.Exclude.map((v: unknown) => String(v)) : [],
+              }))
           : []
         if (list.length === 0) {
           setTenderKeysError('Список ключей пуст или имеет неожиданный формат ответа.')
@@ -238,11 +423,53 @@ export default function App() {
     return new Intl.NumberFormat('ru-RU').format(value)
   }
 
-  async function openTenderAttachments(itemId: string) {
+  async function openKonturPurchase(item: KonturListItem) {
     setIsTenderItemsLoading(true)
     setTenderAttachmentsError('')
     try {
-      const resp = await fetch(`/api/tender-item?id=${encodeURIComponent(itemId)}`)
+      const resp = await fetch(`/api/kontur/purchases/get?id=${encodeURIComponent(item.id)}`)
+      const json = await resp.json().catch(() => null)
+      if (!resp.ok) throw new Error(json?.error ?? `Failed: ${resp.status}`)
+      const detail = (json?.result ?? json) as Record<string, unknown>
+
+      setTenderAttachments(konturAttachmentsFromPurchase(detail))
+      setSelectedTenderMeta(konturMetaFromPurchase(item, detail))
+      setTenderModalStep('attachments')
+    } catch (e) {
+      setTenderAttachments([])
+      setTenderAttachmentsError(e instanceof Error ? e.message : 'Не удалось загрузить файлы.')
+      setTenderModalStep('attachments')
+    } finally {
+      setIsTenderItemsLoading(false)
+    }
+  }
+
+  async function openBicotenderTender(item: BicotenderListItem) {
+    setIsTenderItemsLoading(true)
+    setTenderAttachmentsError('')
+    try {
+      const resp = await fetch(`/api/bicotender/tenders/get?tender_id=${encodeURIComponent(item.id)}`)
+      const json = await resp.json().catch(() => null)
+      if (!resp.ok) throw new Error(json?.error ?? `Failed: ${resp.status}`)
+      const detail = (json?.result ?? json) as Record<string, unknown>
+
+      setTenderAttachments(bicotenderAttachmentsFromDetail(detail))
+      setSelectedTenderMeta(bicotenderMetaFromDetail(item, detail))
+      setTenderModalStep('attachments')
+    } catch (e) {
+      setTenderAttachments([])
+      setTenderAttachmentsError(e instanceof Error ? e.message : 'Не удалось загрузить файлы.')
+      setTenderModalStep('attachments')
+    } finally {
+      setIsTenderItemsLoading(false)
+    }
+  }
+
+  async function openTenderAttachments(item: TenderListItem) {
+    setIsTenderItemsLoading(true)
+    setTenderAttachmentsError('')
+    try {
+      const resp = await fetch(`/api/tenders/get?id=${encodeURIComponent(item._id)}`)
       const json = await resp.json().catch(() => null)
       if (!resp.ok) throw new Error(json?.error ?? `Failed: ${resp.status}`)
       const raw = Array.isArray(json?.attachments) ? json.attachments : []
@@ -250,6 +477,61 @@ export default function App() {
         .filter((x: any) => typeof x?.href === 'string' || typeof x?.realName === 'string')
         .map((x: any) => ({ href: String(x?.href ?? ''), realName: String(x?.realName ?? '') }))
       setTenderAttachments(list)
+      const customersRaw = (json as any)?.customers ?? (json as any)?.data?.customers ?? null
+      const customerGuid =
+        Array.isArray(customersRaw) && customersRaw.length > 0
+          ? String((customersRaw[0] as any)?.guid ?? '').trim()
+          : customersRaw && typeof customersRaw === 'object'
+            ? String((customersRaw as any)?.guid ?? '').trim()
+            : ''
+      let orgShortName: string | null = null
+      let orgInn: string | null = null
+      if (customerGuid) {
+        try {
+          const orgResp = await fetch(`/api/organizations/get?id=${encodeURIComponent(customerGuid)}`)
+          const orgJson = await orgResp.json().catch(() => null)
+          if (orgResp.ok) {
+            orgShortName =
+              typeof orgJson?.shortName === 'string'
+                ? orgJson.shortName
+                : typeof orgJson?.data?.shortName === 'string'
+                  ? orgJson.data.shortName
+                  : null
+            orgInn =
+              typeof orgJson?.inn === 'string'
+                ? orgJson.inn
+                : typeof orgJson?.data?.inn === 'string'
+                  ? orgJson.data.inn
+                  : null
+          }
+        } catch {
+          // keep fallback values when organization fetch fails
+        }
+      }
+      setSelectedTenderMeta({
+        customerName: orgShortName ?? null,
+        customerInn: orgInn,
+        auctionNumber:
+          typeof json?.auctionNumber === 'string'
+            ? json.auctionNumber
+            : typeof item?.auctionNumber === 'string'
+              ? item.auctionNumber
+              : null,
+        maxPrice:
+          typeof json?.maxPrice === 'number'
+            ? json.maxPrice
+            : Number.isFinite(Number(json?.maxPrice))
+              ? Number(json.maxPrice)
+              : typeof item?.maxPrice === 'number'
+                ? item.maxPrice
+                : null,
+        sourceUrl:
+          typeof json?.href === 'string'
+            ? json.href
+            : typeof item?.href === 'string'
+              ? item.href
+              : null,
+      })
       setTenderModalStep('attachments')
     } catch (e) {
       setTenderAttachments([])
@@ -265,7 +547,11 @@ export default function App() {
       setError('')
       setStatus('Загружаю файл из аукционной документации...')
       setIsAttachmentLoading(true)
-      const url = `/api/tender-attachment?href=${encodeURIComponent(fileItem.href)}&realName=${encodeURIComponent(fileItem.realName)}`
+      const attachmentEndpoint =
+        fileItem.source === 'bicotender' || fileItem.source === 'kontur'
+          ? '/api/bicotender/attachment'
+          : '/api/tender-attachment'
+      const url = `${attachmentEndpoint}?href=${encodeURIComponent(fileItem.href)}&realName=${encodeURIComponent(fileItem.realName)}`
       const resp = await fetch(url)
       if (!resp.ok) {
         const json = await resp.json().catch(() => null)
@@ -276,7 +562,7 @@ export default function App() {
       setSelectedRemoteFilename(file.name)
       setStatus('')
       setIsTenderModalOpen(false)
-      await onMatch(file)
+      await onMatch(file, selectedTenderMeta)
     } catch (e) {
       setStatus('')
       setError(e instanceof Error ? e.message : String(e))
@@ -300,7 +586,7 @@ export default function App() {
     }
   }
 
-  async function onMatch(file: File | null) {
+  async function onMatch(file: File | null, tenderMeta?: TenderMetaForMatch | null) {
     setError('')
     if (!file) return
     setStatus('Идёт поиск...')
@@ -312,6 +598,7 @@ export default function App() {
     setBestMatchFilename(null)
     setLlmExplanation(null)
     setAnalyzerInfo(null)
+    setEmailNotification(null)
     try {
       // Обновляем библиотеку перед матчингом, чтобы не зависеть от устаревшего состояния.
       await refreshLibrary().catch(() => undefined)
@@ -320,7 +607,16 @@ export default function App() {
         setError('Библиотека пустая. Сначала добавьте техописания поставщика.')
         return
       }
-      const json = await uploadFile('/api/match', file)
+      const extraFields: Record<string, string> = {}
+      const src = tenderMeta ?? selectedTenderMeta
+      if (src?.auctionNumber) extraFields.auctionNumber = src.auctionNumber
+      if (src?.customerName) extraFields.customerName = src.customerName
+      if (src?.customerInn) extraFields.customerInn = src.customerInn
+      if (typeof src?.maxPrice === 'number' && Number.isFinite(src.maxPrice)) {
+        extraFields.auctionPrice = String(src.maxPrice)
+      }
+      if (src?.sourceUrl) extraFields.sourceUrl = src.sourceUrl
+      const json = await uploadFile('/api/match', file, Object.keys(extraFields).length > 0 ? extraFields : undefined)
       setDecision(json.decision ?? '')
       setMatchPercent(typeof json.matchPercent === 'number' ? json.matchPercent : null)
       setMatches(json.matches ?? [])
@@ -341,6 +637,17 @@ export default function App() {
                     .map((x: string) => x.trim())
                     .filter((x: string) => x.length > 0)
                 : [],
+            }
+          : null,
+      )
+      setEmailNotification(
+        json?.emailNotification && typeof json.emailNotification === 'object'
+          ? {
+              sent: Boolean((json.emailNotification as any).sent),
+              reason:
+                typeof (json.emailNotification as any).reason === 'string'
+                  ? (json.emailNotification as any).reason
+                  : undefined,
             }
           : null,
       )
@@ -425,6 +732,16 @@ export default function App() {
               {analyzerInfo.analyzers.length > 0
                 ? `Да: ${analyzerInfo.analyzers.join(', ')}`
                 : 'Да: указан признак "для анализатора".'}
+            </div>
+          </div>
+        ) : null}
+        {emailNotification ? (
+          <div className="ms-llm">
+            <div className="ms-llm-title">Отправка email</div>
+            <div className="ms-llm-text">
+              {emailNotification.sent
+                ? 'Письмо отправлено.'
+                : `Письмо не отправлено${emailNotification.reason ? `: ${emailNotification.reason}` : '.'}`}
             </div>
           </div>
         ) : null}
@@ -548,7 +865,61 @@ export default function App() {
             ) : null}
             {isTenderItemsLoading || isAttachmentLoading ? <p className="ms-muted">Загрузка...</p> : null}
             {tenderModalStep === 'tenders' && !isTenderItemsLoading && tenderItemsError ? <p className="ms-error">Ошибка: {tenderItemsError}</p> : null}
-            {tenderModalStep === 'tenders' && !isTenderItemsLoading && !tenderItemsError && tenderItems.length === 0 ? (
+            {tenderModalStep === 'tenders' && !isTenderItemsLoading && konturSearchError ? (
+              <p className="ms-error">Kontur ошибка: {konturSearchError}</p>
+            ) : null}
+            {tenderModalStep === 'tenders' && !isTenderItemsLoading && bicotenderError ? (
+              <p className="ms-error">Bicotender ошибка: {bicotenderError}</p>
+            ) : null}
+            {tenderModalStep === 'tenders' && !isTenderItemsLoading && bicotenderItems.length > 0 ? (
+              <div className="ms-grid ms-grid--tenders">
+                {bicotenderItems.map((item) => (
+                  <button
+                    type="button"
+                    key={`bicotender-${item.id}-${item.name}`}
+                    className="ms-card ms-card--tender ms-card--bicotender ms-card-button"
+                    onClick={() => openBicotenderTender(item)}
+                  >
+                    <div className="ms-card-title">{item.name || 'Без названия'}</div>
+                    <div className="ms-line">НМЦК: {formatPrice(item.cost)} ₽</div>
+                    <div className="ms-meta">{item.id || 'Без id'}</div>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {tenderModalStep === 'tenders' && !isTenderItemsLoading && konturItems.length > 0 ? (
+              <div className="ms-grid ms-grid--tenders">
+                {konturItems.map((item) => (
+                  <button
+                    type="button"
+                    key={`kontur-${item.id}-${item.orderName}`}
+                    className="ms-card ms-card--tender ms-card--kontur ms-card-button"
+                    onClick={() => openKonturPurchase(item)}
+                  >
+                    <div className="ms-card-title">{item.orderName || 'Без названия'}</div>
+                    <div className="ms-line">НМЦК: {formatPrice(item.maxPrice)} ₽</div>
+                    {item.link ? (
+                      <a
+                        href={item.link}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="ms-link"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        Перейти по ссылке
+                      </a>
+                    ) : null}
+                    <div className="ms-meta">{item.id || 'Без id'}</div>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {tenderModalStep === 'tenders' &&
+            !isTenderItemsLoading &&
+            !tenderItemsError &&
+            tenderItems.length === 0 &&
+            konturItems.length === 0 &&
+            bicotenderItems.length === 0 ? (
               <p className="ms-muted">Элементы не найдены.</p>
             ) : null}
             {tenderModalStep === 'tenders' && !isTenderItemsLoading && tenderItems.length > 0 ? (
@@ -558,7 +929,7 @@ export default function App() {
                     type="button"
                     className="ms-card ms-card--tender ms-card-button"
                     key={`${item._id}-${item.orderName}`}
-                    onClick={() => openTenderAttachments(item._id)}
+                    onClick={() => openTenderAttachments(item)}
                   >
                     <div className="ms-card-title">{item.orderName || 'Без названия'}</div>
                     <div className="ms-line">НМЦК: {formatPrice(item.maxPrice)} ₽</div>
