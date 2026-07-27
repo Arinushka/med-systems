@@ -20,7 +20,12 @@ export type LibraryDoc = {
   originalFilename: string
   extension: string
   storedPath: string
+  contentHash?: string
+  normalizedTextHash?: string
+  extractedText?: string
   docEmbedding: number[]
+  embeddingModel?: string
+  pipelineVersion?: string
   chunksCount?: number
   chunks?: LibraryChunk[]
   rowsCount?: number

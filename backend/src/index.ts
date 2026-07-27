@@ -6,6 +6,7 @@ import cors from 'cors'
 import multer from 'multer'
 import crypto from 'node:crypto'
 import path from 'node:path'
+import https from 'node:https'
 import { existsSync } from 'node:fs'
 import fs from 'node:fs/promises'
 
@@ -13,19 +14,23 @@ import { embedTexts } from './lib/openaiEmbeddings.js'
 import { centroid } from './lib/centroid.js'
 import { cosineSimilarity } from './utils/cosine.js'
 import { extractRowsFromFile } from './lib/rows.js'
+import { extractTextFromFile } from './lib/extract.js'
 import { loadIndex, saveIndex, type LibraryDoc } from './lib/indexStore.js'
 import { valuesMatch } from './lib/valueCompare.js'
 import { compareProductNamesWithOllama, judgeMatch, type RowForJudge, type JudgeDecision } from './lib/judge.js'
 import {
   compositionLongTextFallbackMatch,
+  indicatorsLookKeywordSimilar,
   isExcludedFromParameterMatch,
   scoreKeyValueIndicators,
   tenderAliasesAllowValueCompare,
 } from './lib/keyValueScoring.js'
 import { extractNormalizedProductNamesFromRows } from './lib/productName.js'
+import { createMatchingRuntime } from './matching/factory.js'
 
 const app = express()
 const MATCH_NOTIFY_EMAIL = 'arina.mykhova@yandex.ru'
+const matchingRuntime = createMatchingRuntime()
 
 type TenderKeyEnrichment = {
   Text: string[]
@@ -1098,6 +1103,71 @@ function enrichTenderKey(key: { _id: string; name: string }): { _id: string; nam
   }
 }
 
+function findLocalTenderKeyByIdOrName(keyId: string): TenderKeyEnrichment | null {
+  const normalized = keyId.trim().toLowerCase()
+  if (!normalized) return null
+  return TENDER_KEY_ENRICHMENTS[normalized] ?? null
+}
+
+function buildLocalTenderKeysFallback(): Array<{ _id: string; name: string; Text: string[]; Exclude: string[] }> {
+  return Object.keys(TENDER_KEY_ENRICHMENTS)
+    .sort((a, b) => a.localeCompare(b, 'ru'))
+    .map((name) =>
+      enrichTenderKey({
+        // Keep _id in plain form so frontend sends ?key=<value> in legacy-like format.
+        _id: name,
+        name,
+      }),
+    )
+}
+
+type TenderKeyItem = { _id: string; name: string; Text: string[]; Exclude: string[] }
+
+function getTenderKeysCacheCandidates(): string[] {
+  return [
+    path.join(process.cwd(), 'data', 'tender-keys-cache.json'),
+    path.join(process.cwd(), 'backend', 'data', 'tender-keys-cache.json'),
+    path.join(process.cwd(), '..', 'backend', 'data', 'tender-keys-cache.json'),
+  ]
+}
+
+function normalizeTenderKeyItems(raw: unknown): TenderKeyItem[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((x: any) => typeof x?._id === 'string' && typeof x?.name === 'string')
+    .map((x: any) =>
+      enrichTenderKey({
+        _id: String(x._id),
+        name: String(x.name),
+      }),
+    )
+}
+
+async function readCachedTenderKeys(): Promise<TenderKeyItem[] | null> {
+  for (const cachePath of getTenderKeysCacheCandidates()) {
+    try {
+      const text = await fs.readFile(cachePath, 'utf8')
+      const json = JSON.parse(text)
+      const keys = normalizeTenderKeyItems(json)
+      if (keys.length > 0) return keys
+    } catch {
+      // ignore and try next candidate
+    }
+  }
+  return null
+}
+
+async function writeCachedTenderKeys(keys: TenderKeyItem[]): Promise<void> {
+  if (keys.length === 0) return
+  const cachePath = getTenderKeysCacheCandidates()[0]
+  try {
+    await fs.mkdir(path.dirname(cachePath), { recursive: true })
+    await fs.writeFile(cachePath, JSON.stringify(keys), 'utf8')
+  } catch {
+    // cache persistence is best-effort
+  }
+}
+
 function parseStringArrayQuery(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.map((x) => String(x).trim()).filter((x) => x.length > 0)
@@ -1106,6 +1176,189 @@ function parseStringArrayQuery(value: unknown): string[] {
     return [value.trim()]
   }
   return []
+}
+
+function normalizeTextForMatch(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s*.-]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function tokenizeForWordMatch(value: string): string[] {
+  return normalizeTextForMatch(value)
+    .replace(/[._-]+/g, ' ')
+    .split(/\s+/g)
+    .map((x) => x.trim())
+    .filter((x) => x.length > 0)
+}
+
+function wildcardPatternToRegex(pattern: string): RegExp | null {
+  const normalized = normalizeTextForMatch(pattern)
+  if (!normalized) return null
+  const escaped = normalized
+    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '[\\p{L}\\p{N}_-]*')
+  try {
+    // Require token boundaries to prevent partial word matches
+    // (e.g. "covid" must not match "covidien").
+    return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}($|[^\\p{L}\\p{N}])`, 'iu')
+  } catch {
+    return null
+  }
+}
+
+function keywordLooksMatched(haystack: string, keyword: string): boolean {
+  const hs = normalizeTextForMatch(haystack)
+  if (!hs) return false
+
+  const normalizedKeyword = normalizeTextForMatch(keyword)
+  if (!normalizedKeyword) return false
+
+  const regex = wildcardPatternToRegex(normalizedKeyword)
+  if (regex && regex.test(hs)) return true
+
+  // Strict token matching for non-wildcard words.
+  if (!normalizedKeyword.includes('*')) {
+    const keyTokens = tokenizeForWordMatch(normalizedKeyword)
+    if (keyTokens.length === 0) return false
+    const hayTokens = new Set(tokenizeForWordMatch(hs))
+    return keyTokens.every((token) => hayTokens.has(token))
+  }
+
+  return false
+}
+
+function konturItemSearchText(item: any): string {
+  const fields = [
+    item?.OrderName,
+    item?.orderName,
+    item?.ObjectName,
+    item?.objectName,
+    item?.Description,
+    item?.description,
+    item?.Name,
+    item?.name,
+  ]
+  return fields.filter((x) => typeof x === 'string').join(' ')
+}
+
+function semanticPreScore(searchText: string, queryTerms: string[]): number {
+  const hayTokens = tokenizeForWordMatch(searchText)
+  if (hayTokens.length === 0) return 0
+
+  const haySet = new Set(hayTokens)
+  const hayRoots = new Set(hayTokens.filter((t) => t.length >= 5).map((t) => t.slice(0, 5)))
+  let score = 0
+
+  for (const queryTerm of queryTerms) {
+    const qTokens = tokenizeForWordMatch(queryTerm)
+    for (const qt of qTokens) {
+      if (haySet.has(qt)) {
+        score += 3
+        continue
+      }
+      // Morphology-like root fallback only for Cyrillic terms, otherwise
+      // we'd get false positives like "covid" vs "covidien".
+      if (qt.length >= 5 && /[\u0400-\u04FF]/.test(qt) && hayRoots.has(qt.slice(0, 5))) {
+        score += 1
+      }
+    }
+  }
+
+  return score
+}
+
+async function filterKonturItemsByAi(params: {
+  items: unknown[]
+  text: string[]
+  exclude: string[]
+}): Promise<unknown[]> {
+  const queryTerms = params.text.map((x) => x.trim()).filter((x) => x.length > 0)
+  if (queryTerms.length === 0) return params.items
+
+  const aiEnabled = String(process.env.KONTUR_AI_FILTER_ENABLED ?? 'true') !== 'false'
+  const maxAiChecksRaw = Number(process.env.KONTUR_AI_FILTER_MAX_CHECKS ?? 0)
+  const maxAiChecks = Number.isFinite(maxAiChecksRaw) && maxAiChecksRaw > 0 ? Math.floor(maxAiChecksRaw) : null
+  const aiBatchSizeRaw = Number(process.env.KONTUR_AI_FILTER_BATCH_SIZE ?? 12)
+  const aiBatchSize = Number.isFinite(aiBatchSizeRaw) && aiBatchSizeRaw > 0 ? Math.floor(aiBatchSizeRaw) : 12
+  const aiTimeoutMs = Number(process.env.KONTUR_AI_FILTER_AI_TIMEOUT_MS ?? 2500)
+  const minSimilarity = Number(process.env.KONTUR_AI_FILTER_MIN_SIMILARITY ?? 0.35)
+  const minConfidence = Number(process.env.KONTUR_AI_FILTER_MIN_CONFIDENCE ?? 0.35)
+
+  const out: unknown[] = []
+  const uncertain: Array<{ item: unknown; searchText: string; preScore: number }> = []
+
+  for (const rawItem of params.items) {
+    const item = rawItem as any
+    const searchText = konturItemSearchText(item)
+    const normalizedSearchText = normalizeTextForMatch(searchText)
+    if (!normalizedSearchText) continue
+
+    const hasExcluded = params.exclude.some((kw) => keywordLooksMatched(normalizedSearchText, kw))
+    const directMatch = queryTerms.some((kw) => keywordLooksMatched(normalizedSearchText, kw))
+
+    // Keep clear direct matches when they don't conflict with exclusion terms.
+    if (directMatch && !hasExcluded) {
+      out.push(item)
+      continue
+    }
+
+    // Ambiguous items (direct+excluded, or semantic-only candidates) go to AI stage.
+    // This avoids hard-cutting potentially relevant positions.
+    if (!directMatch && hasExcluded) {
+      // Clear exclusion without any positive evidence -> skip.
+      continue
+    }
+
+    uncertain.push({
+      item,
+      searchText,
+      preScore: semanticPreScore(normalizedSearchText, queryTerms) + (directMatch ? 2 : 0),
+    })
+  }
+
+  // AI stage for uncertain candidates: bounded and timeout-protected.
+  if (!aiEnabled || uncertain.length === 0) return out
+
+  const sorted = uncertain.sort((a, b) => b.preScore - a.preScore)
+  const candidates = maxAiChecks ? sorted.slice(0, maxAiChecks) : sorted
+
+  for (let i = 0; i < candidates.length; i += aiBatchSize) {
+    const batch = candidates.slice(i, i + aiBatchSize)
+    const aiResults = await Promise.allSettled(
+      batch.map(async (candidate) => {
+        const aiPromise = compareProductNamesWithOllama({
+          queryNames: queryTerms,
+          libraryNames: [candidate.searchText],
+        })
+        const timed = await Promise.race([
+          aiPromise,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), aiTimeoutMs)),
+        ])
+        return { candidate, ai: timed }
+      }),
+    )
+
+    for (const result of aiResults) {
+      if (result.status !== 'fulfilled') continue
+      const ai = result.value.ai
+      if (!ai) {
+        // If AI is unavailable/timeout, keep strong semantic candidates to avoid
+        // dropping relevant tenders due model/network instability.
+        if (result.value.candidate.preScore >= 2) {
+          out.push(result.value.candidate.item)
+        }
+        continue
+      }
+      if (ai.match && ai.similarity >= minSimilarity && ai.confidence >= minConfidence) {
+        out.push(result.value.candidate.item)
+      }
+    }
+  }
+
+  return out
 }
 
 function formatDateYmd(date: Date): string {
@@ -1131,6 +1384,19 @@ type KonturSearchParams = {
   attachments: boolean
 }
 
+function isKonturTransientNetworkError(message: string): boolean {
+  const m = String(message ?? '').toLowerCase()
+  return (
+    m.includes('fetch failed') ||
+    m.includes('aborted') ||
+    m.includes('timeout') ||
+    m.includes('econnreset') ||
+    m.includes('enotfound') ||
+    m.includes('eai_again') ||
+    m.includes('socket hang up')
+  )
+}
+
 async function fetchKonturSearchAllPages(params: KonturSearchParams): Promise<{
   TotalCount: number
   Items: unknown[]
@@ -1151,24 +1417,45 @@ async function fetchKonturSearchAllPages(params: KonturSearchParams): Promise<{
   const allItems: unknown[] = []
   let totalCount = 0
   let pageNumber = 0
+  const retries = Math.max(0, Number(process.env.KONTUR_SEARCH_RETRIES ?? 2))
+  const retryBaseDelayMs = Math.max(100, Number(process.env.KONTUR_SEARCH_RETRY_BASE_DELAY_MS ?? 1200))
 
   while (true) {
-    const upstream = await fetch(url.toString(), {
-      method: 'POST',
-      headers: {
-        'X-Kontur-Apikey': params.apiKey,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({ ...baseBody, PageNumber: pageNumber }),
-      signal: AbortSignal.timeout(30000),
-    })
+    let upstream: Response
+    let lastNetworkError: string | null = null
+    let attempt = 0
+    while (true) {
+      try {
+        upstream = await fetch(url.toString(), {
+          method: 'POST',
+          headers: {
+            'X-Kontur-Apikey': params.apiKey,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({ ...baseBody, PageNumber: pageNumber }),
+          signal: AbortSignal.timeout(30000),
+        })
+        break
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e)
+        lastNetworkError = message
+        if (!isKonturTransientNetworkError(message) || attempt >= retries) {
+          throw e
+        }
+        await new Promise((resolve) => setTimeout(resolve, retryBaseDelayMs * Math.pow(2, attempt)))
+        attempt += 1
+      }
+    }
 
-    const json = (await upstream.json().catch(() => null)) as Record<string, unknown> | null
-    if (!upstream.ok) {
-      const err = new Error(`Kontur API error: ${upstream.status}`) as Error & { details?: unknown }
+    const json = (await upstream!.json().catch(() => null)) as Record<string, unknown> | null
+    if (!upstream!.ok) {
+      const err = new Error(`Kontur API error: ${upstream!.status}`) as Error & { details?: unknown }
       err.details = json
       throw err
+    }
+    if (lastNetworkError) {
+      // Network recovered after retries; continue with successful response.
     }
 
     totalCount = Number(json?.TotalCount ?? 0)
@@ -1201,64 +1488,18 @@ async function fetchKonturPurchaseById(apiKey: string, purchaseId: string): Prom
   return json ?? {}
 }
 
-function getBicotenderCredentials(): { login: string; password: string } | null {
-  const login = asNonEmptyString(process.env.BICOTENDER_LOGIN)
-  const password = asNonEmptyString(process.env.BICOTENDER_PASSWORD)
-  if (!login || !password) return null
-  return { login, password }
-}
-
-async function fetchBicotenderTenders(params: {
-  login: string
-  password: string
-  keywords: string[]
-  nokeywords: string[]
-}): Promise<Record<string, unknown>> {
-  const url = new URL('https://www.bicotender.ru/api3/tenders/')
-  url.searchParams.set('login', params.login)
-  url.searchParams.set('password', params.password)
-  for (const keyword of params.keywords) url.searchParams.append('keywords', keyword)
-  for (const nokeyword of params.nokeywords) url.searchParams.append('nokeywords', nokeyword)
-
-  const upstream = await fetch(url.toString(), {
-    headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(60000),
-  })
-
-  const json = (await upstream.json().catch(() => null)) as Record<string, unknown> | null
-  if (!upstream.ok) {
-    const err = new Error(`Bicotender API error: ${upstream.status}`) as Error & { details?: unknown }
-    err.details = json
-    throw err
-  }
-
-  return json ?? {}
-}
-
-async function fetchBicotenderTenderById(tenderId: string): Promise<Record<string, unknown>> {
-  const creds = getBicotenderCredentials()
-  if (!creds) throw new Error('BICOTENDER_LOGIN and BICOTENDER_PASSWORD are not configured')
-
-  const url = new URL(`https://www.bicotender.ru/api3/tenders/${encodeURIComponent(tenderId)}`)
-  url.searchParams.set('login', creds.login)
-  url.searchParams.set('password', creds.password)
-
-  const upstream = await fetch(url.toString(), {
-    headers: { Accept: 'application/json' },
-    signal: AbortSignal.timeout(60000),
-  })
-
-  const json = (await upstream.json().catch(() => null)) as Record<string, unknown> | null
-  if (!upstream.ok) {
-    const err = new Error(`Bicotender API error: ${upstream.status}`) as Error & { details?: unknown }
-    err.details = json
-    throw err
-  }
-
-  return json ?? {}
-}
-
 async function resolveTenderKeyEnrichmentById(keyId: string): Promise<{ Text: string[]; Exclude: string[] }> {
+  const local = findLocalTenderKeyByIdOrName(keyId)
+  if (local) {
+    return { Text: local?.Text ?? [], Exclude: local?.Exclude ?? [] }
+  }
+
+  const cached = await readCachedTenderKeys()
+  if (cached) {
+    const cachedKey = cached.find((x) => x._id === keyId)
+    if (cachedKey) return { Text: cachedKey.Text ?? [], Exclude: cachedKey.Exclude ?? [] }
+  }
+
   const token =
     process.env.TENDERPLAN_API_TOKEN ??
     'f6cf879e0113dc709cb929e4281a9f54b21a5ef6b3e4190523837650d2c1e0995ad31d17524739a5c011c7b0255e33e994daee02249d6eb4a530e22132bc2116'
@@ -1286,6 +1527,7 @@ async function resolveTenderKeyEnrichmentById(keyId: string): Promise<{ Text: st
 }
 
 type MatchNotificationPayload = {
+  recipientEmail: string
   auctionNumber: string | null
   customerName: string | null
   customerInn: string | null
@@ -1299,6 +1541,244 @@ type MatchNotificationPayload = {
   matchPercent: number
 }
 
+type MatchNotificationResult = {
+  sent: boolean
+  reason?: string
+}
+
+type CrmFingerprintStore = {
+  fingerprints: string[]
+}
+
+function autoDataPath(filename: string): string {
+  return path.join(process.cwd(), 'data', filename)
+}
+
+function stableFingerprint(parts: Array<string | number | null | undefined>): string {
+  const payload = parts.map((x) => String(x ?? '').trim()).join('|')
+  return crypto.createHash('sha256').update(payload).digest('hex')
+}
+
+function normalizeUrlForDedupe(value: string | null | undefined): string | null {
+  const raw = asNonEmptyString(value)
+  if (!raw) return null
+  try {
+    const u = new URL(raw)
+    u.hash = ''
+    // Keep query (uid is often inside query), normalize only pathname tail.
+    if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/+$/, '')
+    return u.toString()
+  } catch {
+    return raw.trim()
+  }
+}
+
+function crmPrimaryDedupeKey(payload: MatchNotificationPayload): string {
+  const normalizedSourceUrl = normalizeUrlForDedupe(payload.sourceUrl)
+  if (normalizedSourceUrl) return `url:${normalizedSourceUrl}`
+  const auctionNumber = asNonEmptyString(payload.auctionNumber)
+  if (auctionNumber) return `auction:${auctionNumber}`
+  return `file:${payload.uploadedFilename}`
+}
+
+function matchFingerprint(payload: MatchNotificationPayload): string {
+  // Use stable tender identity only; do not include volatile matching fields.
+  return stableFingerprint([crmPrimaryDedupeKey(payload)])
+}
+
+async function readCrmFingerprintStore(): Promise<Set<string>> {
+  const p = autoDataPath('crm-sent-fingerprints.json')
+  try {
+    const raw = await fs.readFile(p, 'utf8')
+    const parsed = JSON.parse(raw) as CrmFingerprintStore
+    if (!parsed || !Array.isArray(parsed.fingerprints)) return new Set<string>()
+    return new Set(parsed.fingerprints.map((x) => String(x)).filter((x) => x.length > 0))
+  } catch {
+    return new Set<string>()
+  }
+}
+
+async function writeCrmFingerprintStore(values: Set<string>): Promise<void> {
+  const p = autoDataPath('crm-sent-fingerprints.json')
+  await fs.mkdir(path.dirname(p), { recursive: true })
+  const payload: CrmFingerprintStore = { fingerprints: [...values].slice(-5000) }
+  await fs.writeFile(p, JSON.stringify(payload), 'utf8')
+}
+
+function buildMatchNotificationText(payload: MatchNotificationPayload): string {
+  const auctionPriceText =
+    typeof payload.auctionPrice === 'number' && Number.isFinite(payload.auctionPrice)
+      ? `${new Intl.NumberFormat('ru-RU').format(payload.auctionPrice)} ₽`
+      : 'не указана'
+
+  const lines = [
+    'Сопоставление файлов завершено.',
+    '',
+    `Статус: ${payload.decision === 'match' ? 'соответствует' : 'не соответствует'}`,
+    `Файл аукциона: ${payload.uploadedFilename}`,
+    `Лучшее совпадение: ${payload.bestMatchFilename ?? 'не найдено'}`,
+    `Процент совпадения: ${payload.matchPercent.toFixed(1)}%`,
+    `Совпавших критериев: ${payload.matchedCount}/${payload.totalCount}`,
+    '',
+    `Номер аукциона: ${payload.auctionNumber ?? 'не указан'}`,
+    `Заказчик: ${payload.customerName ?? 'не указан'}`,
+    `ИНН заказчика: ${payload.customerInn ?? 'не указан'}`,
+    `Цена аукциона: ${auctionPriceText}`,
+    `Ссылка: ${payload.sourceUrl ?? 'не указана'}`,
+  ]
+
+  return lines.join('\n')
+}
+
+function stripAutoMatchFingerprintMarker(text: string): string {
+  return text.replace(/\s*\[AUTO_MATCH_FP:[a-f0-9]{64}\]/gi, '').trim()
+}
+
+function parseWireCrmList(json: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(json)) return json.filter((x) => x && typeof x === 'object') as Array<Record<string, unknown>>
+  if (json && typeof json === 'object') {
+    const j = json as Record<string, unknown>
+    const data = j.data
+    if (Array.isArray(data)) return data.filter((x) => x && typeof x === 'object') as Array<Record<string, unknown>>
+    const items = j.items
+    if (Array.isArray(items)) return items.filter((x) => x && typeof x === 'object') as Array<Record<string, unknown>>
+  }
+  return []
+}
+
+async function wireCrmHasFingerprint(params: {
+  apiKey: string
+  baseUrl: string
+  fingerprint: string
+  payload: MatchNotificationPayload
+}): Promise<{ found: boolean; searchUnavailable: boolean; reason?: string }> {
+  const name = params.payload.auctionNumber ?? params.payload.uploadedFilename
+  const sourceUrlNormalized = normalizeUrlForDedupe(params.payload.sourceUrl)
+  const requestUrls: URL[] = []
+  const baseListUrl = new URL(`${params.baseUrl.replace(/\/+$/, '')}/tenders`)
+  baseListUrl.searchParams.set('limit', '100')
+  if (name) {
+    const byName = new URL(baseListUrl.toString())
+    byName.searchParams.set('name', name)
+    requestUrls.push(byName)
+  }
+  // Additional scan without `name` catches records where CRM stored another title.
+  requestUrls.push(baseListUrl)
+
+  try {
+    let anySearchSucceeded = false
+    const marker = `[AUTO_MATCH_FP:${params.fingerprint}]`
+    for (const url of requestUrls) {
+      const response = await fetch(url.toString(), {
+        headers: {
+          Accept: 'application/json',
+          'X-API-KEY': params.apiKey,
+        },
+        signal: AbortSignal.timeout(15000),
+      })
+      if (!response.ok) continue
+      anySearchSucceeded = true
+      const json = await response.json().catch(() => null)
+      const rows = parseWireCrmList(json)
+      const byMarker = rows.some((row) => String(row.description ?? '').includes(marker))
+      if (byMarker) return { found: true, searchUnavailable: false }
+      const bySite = sourceUrlNormalized
+        ? rows.some((row) => normalizeUrlForDedupe(String(row.site ?? '')) === sourceUrlNormalized)
+        : false
+      if (bySite) return { found: true, searchUnavailable: false }
+      const byName = name
+        ? rows.some((row) => asNonEmptyString(row.name) === asNonEmptyString(name))
+        : false
+      if (!sourceUrlNormalized && byName) return { found: true, searchUnavailable: false }
+    }
+    if (!anySearchSucceeded) {
+      return { found: false, searchUnavailable: true, reason: 'search unavailable' }
+    }
+    return { found: false, searchUnavailable: false }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    return { found: false, searchUnavailable: true, reason: message }
+  }
+}
+
+async function sendMatchNotificationToCrm(payload: MatchNotificationPayload): Promise<MatchNotificationResult> {
+  const apiKey = asNonEmptyString(process.env.WIRECRM_API_KEY)
+  if (!apiKey) return { sent: false, reason: 'Skipped: WIRECRM_API_KEY is not configured' }
+
+  const baseUrl = asNonEmptyString(process.env.WIRECRM_API_BASE_URL) ?? 'https://wirecrm.com/api/v1'
+  const endpoint = `${baseUrl.replace(/\/+$/, '')}/tenders`
+  const fingerprint = matchFingerprint(payload)
+  const localSent = await readCrmFingerprintStore()
+  if (localSent.has(fingerprint)) return { sent: false, reason: 'Skipped: already sent (local cache)' }
+
+  const search = await wireCrmHasFingerprint({
+    apiKey,
+    baseUrl,
+    fingerprint,
+    payload,
+  })
+  if (search.found) {
+    localSent.add(fingerprint)
+    await writeCrmFingerprintStore(localSent)
+    return { sent: false, reason: 'Skipped: already sent (CRM search)' }
+  }
+  if (search.searchUnavailable && localSent.has(fingerprint)) {
+    return { sent: false, reason: 'Skipped: already sent (local fallback)' }
+  }
+
+  const name = payload.auctionNumber ?? payload.uploadedFilename ?? 'Тендер без номера'
+  const linkFieldName = asNonEmptyString(process.env.WIRECRM_TENDER_LINK_FIELD_NAME) ?? 'Ссылка'
+  const finalPriceFieldName = asNonEmptyString(process.env.WIRECRM_TENDER_FINAL_PRICE_FIELD_NAME) ?? 'Итоговая цена'
+  const defaultStatusId = asNullableNumber(process.env.WIRECRM_TENDER_STATUS_ID) ?? 240391
+  const description = stripAutoMatchFingerprintMarker(buildMatchNotificationText(payload))
+  const crmPayload: Record<string, unknown> = {
+    name,
+    description,
+    // WireCRM custom tender status set to "AI" by default.
+    status: defaultStatusId,
+    status_id: defaultStatusId,
+  }
+  if (payload.sourceUrl) {
+    // WireCRM standard tender field for link.
+    crmPayload.site = payload.sourceUrl
+    // Explicitly map tender source URL into CRM "Ссылка" field.
+    crmPayload[linkFieldName] = payload.sourceUrl
+  }
+  if (typeof payload.auctionPrice === 'number' && Number.isFinite(payload.auctionPrice)) {
+    // WireCRM standard tender field for final price.
+    crmPayload.price_final = payload.auctionPrice
+    // Explicitly map auction price into CRM "Итоговая цена" field.
+    crmPayload[finalPriceFieldName] = payload.auctionPrice
+  }
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'X-API-KEY': apiKey,
+      },
+      body: JSON.stringify(crmPayload),
+      signal: AbortSignal.timeout(15000),
+    })
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '')
+      return {
+        sent: false,
+        reason: `WireCRM error ${response.status}${body ? `: ${body.slice(0, 250)}` : ''}`,
+      }
+    }
+
+    localSent.add(fingerprint)
+    await writeCrmFingerprintStore(localSent)
+    return { sent: true }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    return { sent: false, reason: message }
+  }
+}
+
 function asNonEmptyString(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()
@@ -1309,6 +1789,32 @@ function asNullableNumber(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) return value
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : null
+}
+
+function clampPercent(value: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback
+  if (value < 0) return 0
+  if (value > 100) return 100
+  return value
+}
+
+function parseBooleanField(value: unknown, fallback: boolean): boolean {
+  if (typeof value !== 'string') return fallback
+  const normalized = value.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+  return fallback
+}
+
+function isValidEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+}
+
+function parsePositiveLimit(value: unknown, fallback: number): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  if (parsed <= 0) return Number.POSITIVE_INFINITY
+  return Math.floor(parsed)
 }
 
 function extractTenderMetaFromResponse(json: any): {
@@ -1330,18 +1836,38 @@ function extractTenderMetaFromResponse(json: any): {
     asNonEmptyString(json?.customerName) ??
     asNonEmptyString(json?.customer?.name) ??
     asNonEmptyString(json?.customer?.fullName) ??
+    asNonEmptyString(json?.customer?.shortName) ??
     asNonEmptyString(json?.customer?.title) ??
+    asNonEmptyString(json?.customers?.[0]?.name) ??
+    asNonEmptyString(json?.customers?.[0]?.fullName) ??
+    asNonEmptyString(json?.customers?.[0]?.shortName) ??
+    asNonEmptyString(json?.customers?.[0]?.title) ??
+    asNonEmptyString(json?.organization?.name) ??
+    asNonEmptyString(json?.organization?.fullName) ??
+    asNonEmptyString(json?.organization?.shortName) ??
     asNonEmptyString(json?.data?.customerName) ??
     asNonEmptyString(json?.data?.customer?.name) ??
     asNonEmptyString(json?.data?.customer?.fullName) ??
+    asNonEmptyString(json?.data?.customer?.shortName) ??
+    asNonEmptyString(json?.data?.customers?.[0]?.name) ??
+    asNonEmptyString(json?.data?.customers?.[0]?.fullName) ??
+    asNonEmptyString(json?.data?.customers?.[0]?.shortName) ??
+    asNonEmptyString(json?.data?.customers?.[0]?.title) ??
+    asNonEmptyString(json?.data?.organization?.name) ??
+    asNonEmptyString(json?.data?.organization?.fullName) ??
+    asNonEmptyString(json?.data?.organization?.shortName) ??
     asNonEmptyString(json?.data?.customer?.title)
 
   const customerInn =
     asNonEmptyString(json?.customerInn) ??
     asNonEmptyString(json?.customer?.inn) ??
+    asNonEmptyString(json?.customers?.[0]?.inn) ??
+    asNonEmptyString(json?.organization?.inn) ??
     asNonEmptyString(json?.inn) ??
     asNonEmptyString(json?.data?.customerInn) ??
     asNonEmptyString(json?.data?.customer?.inn) ??
+    asNonEmptyString(json?.data?.customers?.[0]?.inn) ??
+    asNonEmptyString(json?.data?.organization?.inn) ??
     asNonEmptyString(json?.data?.inn)
 
   return { auctionNumber, customerName, customerInn }
@@ -1376,32 +1902,11 @@ async function sendMatchNotificationEmail(payload: MatchNotificationPayload): Pr
       },
     })
 
-    const auctionPriceText =
-      typeof payload.auctionPrice === 'number' && Number.isFinite(payload.auctionPrice)
-        ? `${new Intl.NumberFormat('ru-RU').format(payload.auctionPrice)} ₽`
-        : 'не указана'
-
-    const lines = [
-      'Сопоставление файлов завершено.',
-      '',
-      `Статус: ${payload.decision === 'match' ? 'соответствует' : 'не соответствует'}`,
-      `Файл аукциона: ${payload.uploadedFilename}`,
-      `Лучшее совпадение: ${payload.bestMatchFilename ?? 'не найдено'}`,
-      `Процент совпадения: ${payload.matchPercent.toFixed(1)}%`,
-      `Совпавших критериев: ${payload.matchedCount}/${payload.totalCount}`,
-      '',
-      `Номер аукциона: ${payload.auctionNumber ?? 'не указан'}`,
-      `Заказчик: ${payload.customerName ?? 'не указан'}`,
-      `ИНН заказчика: ${payload.customerInn ?? 'не указан'}`,
-      `Цена аукциона: ${auctionPriceText}`,
-      `Ссылка: ${payload.sourceUrl ?? 'не указана'}`,
-    ]
-
     const info = await transporter.sendMail({
       from: smtpFrom,
-      to: MATCH_NOTIFY_EMAIL,
+      to: payload.recipientEmail,
       subject: `${payload.auctionNumber ?? 'Без номера аукциона'}`,
-      text: lines.join('\n'),
+      text: buildMatchNotificationText(payload),
     })
     return {
       sent: true,
@@ -1419,6 +1924,7 @@ async function sendMatchNotificationEmail(payload: MatchNotificationPayload): Pr
 app.post('/api/test-email', async (_req, res) => {
   try {
     const result = await sendMatchNotificationEmail({
+      recipientEmail: MATCH_NOTIFY_EMAIL,
       auctionNumber: 'TEST-0001',
       customerName: 'Тестовый заказчик',
       customerInn: '0000000000',
@@ -1525,6 +2031,41 @@ function productNameListsContainmentMatch(a: string[], b: string[]): boolean {
   return false
 }
 
+function toKeywordTokenSet(values: string[]): Set<string> {
+  const stop = new Set([
+    'для',
+    'при',
+    'или',
+    'это',
+    'как',
+    'что',
+    'with',
+    'from',
+    'that',
+    'this',
+    'indicator',
+    'value',
+  ])
+  const out = new Set<string>()
+  for (const value of values) {
+    for (const token of tokenizeForWordMatch(value ?? '')) {
+      if (token.length < 4) continue
+      if (stop.has(token)) continue
+      out.add(token)
+    }
+  }
+  return out
+}
+
+function keywordTokenRecall(queryTokens: Set<string>, docTokens: Set<string>): number {
+  if (queryTokens.size === 0 || docTokens.size === 0) return 0
+  let hit = 0
+  for (const t of queryTokens) {
+    if (docTokens.has(t)) hit++
+  }
+  return hit / queryTokens.size
+}
+
 function extractProductCodesFromText(text: string): string[] {
   const s = (text ?? '').toString().toLowerCase()
   const out = new Set<string>()
@@ -1605,6 +2146,58 @@ function detectAnalyzerInfoFromRows(
   return { hasAnalyzer: true, analyzers: [...out] }
 }
 
+function detectContractLikeDocument(params: {
+  filename: string
+  rows: Array<{ indicator: string; valueRaw: string }>
+}): { isContractLike: boolean; score: number; matchedMarkers: string[] } {
+  const filename = String(params.filename ?? '').toLowerCase()
+  const text = params.rows
+    .map((r) => `${r.indicator ?? ''} ${r.valueRaw ?? ''}`)
+    .join('\n')
+    .toLowerCase()
+
+  const markerRules: Array<{ label: string; regex: RegExp; weight: number }> = [
+    { label: 'проект контракта', regex: /\bпроект\s+контракт[а-яё]*/i, weight: 4 },
+    { label: 'контракт', regex: /\bконтракт[а-яё]*/i, weight: 2 },
+    { label: 'статья', regex: /\bстатья\s*\d+/i, weight: 2 },
+    { label: 'стороны', regex: /\bсторон[аы]\b/i, weight: 1 },
+    { label: 'поставщик', regex: /\bпоставщик[а-яё]*/i, weight: 2 },
+    { label: 'заказчик', regex: /\bзаказчик[а-яё]*/i, weight: 2 },
+    { label: 'цена контракта', regex: /\bцена\s+контракт[а-яё]*/i, weight: 3 },
+    { label: 'порядок расчетов', regex: /\bпорядок\s+расчет[а-яё]*/i, weight: 2 },
+    { label: 'оплата по контракту', regex: /\bоплат[а-яё\s]+контракт[а-яё]*/i, weight: 2 },
+    { label: 'ответственность сторон', regex: /\bответственност[а-яё\s]+сторон/i, weight: 2 },
+    { label: 'неустойка', regex: /\bнеустойк[аи]\b/i, weight: 1 },
+    { label: 'пеня', regex: /\bпен[яи]\b/i, weight: 1 },
+    { label: 'срок поставки', regex: /\bсрок[а-яё\s]+поставк[аи]\b/i, weight: 2 },
+  ]
+
+  let score = 0
+  const matchedMarkers: string[] = []
+  for (const rule of markerRules) {
+    if (rule.regex.test(text)) {
+      score += rule.weight
+      matchedMarkers.push(rule.label)
+    }
+  }
+
+  const filenameLooksContract = /\b(проект[_\s-]*контракт|контракт)\b/i.test(filename)
+  if (filenameLooksContract) {
+    score += 4
+    matchedMarkers.push('filename:contract')
+  }
+
+  const legalRowsCount = params.rows.filter((r) => {
+    const rowText = `${r.indicator ?? ''} ${r.valueRaw ?? ''}`.toLowerCase()
+    return /(контракт|заказчик|поставщик|цена контракта|порядок расчетов|статья)/i.test(rowText)
+  }).length
+  if (legalRowsCount >= 6) score += 4
+
+  const isContractLike =
+    score >= 8 || (filenameLooksContract && score >= 6) || (legalRowsCount >= 10 && matchedMarkers.length >= 3)
+  return { isContractLike, score, matchedMarkers }
+}
+
 // Load environment variables for local dev.
 // We try multiple locations because backend can be started from different working directories.
 const envCandidates = [
@@ -1633,6 +2226,16 @@ const upload = multer({
 })
 
 const LIB_DIR = path.join(process.cwd(), 'data', 'library')
+let libraryIndexLock: Promise<unknown> = Promise.resolve()
+
+async function withLibraryIndexLock<T>(task: () => Promise<T>): Promise<T> {
+  const run = libraryIndexLock.then(task, task)
+  libraryIndexLock = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
 
 function restoreUtf8FromLatin1(maybeMojibake: string): string {
   // If browser sent UTF-8 bytes but headers were decoded as latin1,
@@ -1651,6 +2254,37 @@ function safeExtension(filename: string): string {
   const ext = path.extname(filename).toLowerCase()
   if (!ext) return ''
   return ext
+}
+
+function libraryContentHash(buffer: Buffer): string {
+  return crypto.createHash('sha256').update(buffer).digest('hex')
+}
+
+async function findLibraryDuplicate(params: {
+  docs: LibraryDoc[]
+  buffer: Buffer
+}): Promise<{ id: string; originalFilename: string } | null> {
+  const incomingHash = libraryContentHash(params.buffer)
+
+  for (const doc of params.docs) {
+    if (doc.contentHash && doc.contentHash === incomingHash) {
+      return { id: doc.id, originalFilename: doc.originalFilename }
+    }
+  }
+
+  for (const doc of params.docs) {
+    if (doc.contentHash) continue
+    try {
+      const existing = await fs.readFile(doc.storedPath)
+      if (libraryContentHash(existing) === incomingHash) {
+        return { id: doc.id, originalFilename: doc.originalFilename }
+      }
+    } catch {
+      // Ignore missing/unreadable files during duplicate check.
+    }
+  }
+
+  return null
 }
 
 app.get('/api/health', (_req, res) => {
@@ -1681,36 +2315,81 @@ app.get('/api/tender-keys', async (_req, res) => {
 
     const json = await upstream.json().catch(() => null)
     if (!upstream.ok) {
-      return res.status(502).json({
-        error: `TenderPlan API error: ${upstream.status}`,
+      const cachedKeys = await readCachedTenderKeys()
+      if (cachedKeys) {
+        return res.json({
+          ok: true,
+          keys: cachedKeys,
+          source: 'cache',
+          warning: `TenderPlan API error: ${upstream.status}`,
+          details: json,
+        })
+      }
+      const fallbackKeys = buildLocalTenderKeysFallback()
+      return res.json({
+        ok: true,
+        keys: fallbackKeys,
+        source: 'fallback',
+        warning: `TenderPlan API error: ${upstream.status}`,
         details: json,
       })
     }
 
     const rawList = Array.isArray(json) ? json : Array.isArray((json as any)?.data) ? (json as any).data : []
-    const list = rawList
-      .filter((x: any) => typeof x?._id === 'string' && typeof x?.name === 'string')
-      .map((x: any) => enrichTenderKey({ _id: String(x._id), name: String(x.name) }))
+    const list = normalizeTenderKeyItems(rawList)
+    await writeCachedTenderKeys(list)
 
     res.json({ ok: true, keys: list })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
-    res.status(500).json({ error: message })
+    const cachedKeys = await readCachedTenderKeys()
+    if (cachedKeys) {
+      return res.json({
+        ok: true,
+        keys: cachedKeys,
+        source: 'cache',
+        warning: message,
+      })
+    }
+    const fallbackKeys = buildLocalTenderKeysFallback()
+    res.json({
+      ok: true,
+      keys: fallbackKeys,
+      source: 'fallback',
+      warning: message,
+    })
   }
 })
 
 app.get('/api/tender-tenders', async (req, res) => {
   try {
-    const keyId = String(req.query.keyId ?? req.query.key ?? req.query._id ?? '').trim()
-    if (!keyId) return res.status(400).json({ error: 'Missing keyId query param' })
+    const keyIds = Array.from(
+      new Set(
+        [
+          ...parseStringArrayQuery(req.query.keyId),
+          ...parseStringArrayQuery(req.query.key),
+          ...parseStringArrayQuery(req.query._id),
+        ]
+          .map((x) => x.trim())
+          .filter((x) => x.length > 0),
+      ),
+    )
+    if (keyIds.length === 0) return res.status(400).json({ error: 'Missing keyId query param' })
+
+    const upstreamKeyIds = keyIds.filter((keyId) => !findLocalTenderKeyByIdOrName(keyId))
+    if (upstreamKeyIds.length === 0) {
+      return res.json({ ok: true, tenders: [], source: 'fallback' })
+    }
 
     const token =
       process.env.TENDERPLAN_API_TOKEN ??
       'f6cf879e0113dc709cb929e4281a9f54b21a5ef6b3e4190523837650d2c1e0995ad31d17524739a5c011c7b0255e33e994daee02249d6eb4a530e22132bc2116'
 
     const url = new URL('https://tenderplan.ru/api/tenders/getlist')
-    // Pass selected key id as query param for upstream compatibility.
-    url.searchParams.set('key', keyId)
+    // Support selecting multiple keys by repeating the `key` query param.
+    for (const keyId of upstreamKeyIds) {
+      url.searchParams.append('key', keyId)
+    }
 
     const upstream = await fetch(url.toString(), {
       headers: {
@@ -1738,8 +2417,11 @@ app.get('/api/tender-tenders', async (req, res) => {
         _id: String(x?._id ?? ''),
         orderName: String(x?.orderName ?? ''),
       }))
+    const uniqueTenders = Array.from(
+      new Map(tenders.map((x: { _id: string; orderName: string }) => [x._id, x])).values(),
+    )
 
-    res.json({ ok: true, tenders })
+    res.json({ ok: true, tenders: uniqueTenders })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     res.status(500).json({ error: message })
@@ -1775,11 +2457,45 @@ app.get('/api/kontur/search', async (req, res) => {
       attachments,
     })
 
+    const filteredItems = await filterKonturItemsByAi({
+      items: Array.isArray((json as any)?.Items) ? (json as any).Items : [],
+      text,
+      exclude,
+    })
+    ;(json as any).Items = filteredItems
+    ;(json as any).TotalCount = filteredItems.length
+
     res.json({ ok: true, result: json, Text: text, Exclude: exclude, Attachments: attachments })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     const details = e && typeof e === 'object' && 'details' in e ? (e as { details?: unknown }).details : undefined
+    if (isKonturTransientNetworkError(message)) {
+      return res.json({
+        ok: true,
+        warning: `Kontur API temporary network issue: ${message}`,
+        details,
+        result: {
+          TotalCount: 0,
+          Items: [],
+          PageNumber: 0,
+        },
+      })
+    }
     if (message.startsWith('Kontur API error:')) {
+      const status = typeof (details as any)?.status === 'number' ? Number((details as any).status) : null
+      const title = typeof (details as any)?.title === 'string' ? String((details as any).title) : ''
+      if (status === 403 && /invalid subscription period/i.test(title)) {
+        return res.json({
+          ok: true,
+          warning: 'Kontur API subscription period is invalid',
+          details,
+          result: {
+            TotalCount: 0,
+            Items: [],
+            PageNumber: 0,
+          },
+        })
+      }
       return res.status(502).json({ error: message, details })
     }
     res.status(500).json({ error: message })
@@ -1806,81 +2522,69 @@ app.get('/api/kontur/purchases/get', async (req, res) => {
   }
 })
 
-app.get('/api/bicotender/tenders/get', async (req, res) => {
-  try {
-    const tenderId = String(req.query.tender_id ?? req.query.id ?? '').trim()
-    if (!tenderId) return res.status(400).json({ error: 'Missing tender_id query param' })
-
-    const result = await fetchBicotenderTenderById(tenderId)
-    res.json({ ok: true, result })
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e)
-    const details = e && typeof e === 'object' && 'details' in e ? (e as { details?: unknown }).details : undefined
-    if (message.startsWith('Bicotender API error:')) {
-      return res.status(502).json({ error: message, details })
-    }
-    if (message.includes('not configured')) {
-      return res.status(500).json({ error: message })
-    }
-    res.status(500).json({ error: message })
-  }
+app.get('/api/bicotender/tenders/get', async (_req, res) => {
+  res.status(410).json({ error: 'Bicotender API integration is disabled' })
 })
 
-app.get('/api/bicotender/tenders', async (req, res) => {
-  try {
-    const creds = getBicotenderCredentials()
-    if (!creds) {
-      return res.status(500).json({ error: 'BICOTENDER_LOGIN and BICOTENDER_PASSWORD are not configured' })
-    }
-    const { login, password } = creds
-
-    let keywords = parseStringArrayQuery(req.query.keywords)
-    let nokeywords = parseStringArrayQuery(req.query.nokeywords)
-    if (keywords.length === 0) keywords = parseStringArrayQuery(req.query.Text)
-    if (nokeywords.length === 0) nokeywords = parseStringArrayQuery(req.query.Exclude)
-
-    const keyId = asNonEmptyString(req.query.keyId ?? req.query.key)
-    if (keyId && keywords.length === 0 && nokeywords.length === 0) {
-      const enrichment = await resolveTenderKeyEnrichmentById(keyId)
-      keywords = enrichment.Text
-      nokeywords = enrichment.Exclude
-    }
-
-    const result = await fetchBicotenderTenders({ login, password, keywords, nokeywords })
-
-    res.json({ ok: true, result, keywords, nokeywords })
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e)
-    const details = e && typeof e === 'object' && 'details' in e ? (e as { details?: unknown }).details : undefined
-    if (message.startsWith('Bicotender API error:')) {
-      return res.status(502).json({ error: message, details })
-    }
-    res.status(500).json({ error: message })
-  }
+app.get('/api/bicotender/tenders', async (_req, res) => {
+  res.status(410).json({ error: 'Bicotender API integration is disabled' })
 })
 
-app.get('/api/bicotender/attachment', async (req, res) => {
+async function proxyKonturAttachment(req: express.Request, res: express.Response): Promise<void> {
   try {
     const href = String(req.query.href ?? '').trim()
     const realName = String(req.query.realName ?? 'attachment').trim() || 'attachment'
-    if (!href) return res.status(400).json({ error: 'Missing href query param' })
-
-    const downloadUrl = new URL(href)
-    if (!/^https?:$/.test(downloadUrl.protocol)) {
-      return res.status(400).json({ error: 'Invalid href protocol' })
+    if (!href) {
+      res.status(400).json({ error: 'Missing href query param' })
+      return
     }
 
-    const upstream = await fetch(downloadUrl.toString(), {
-      signal: AbortSignal.timeout(60000),
-    })
+    // Kontur can return both absolute and relative links in Docs.Url.
+    const downloadUrl = new URL(href, 'https://zakupki.kontur.ru')
+    if (!/^https?:$/.test(downloadUrl.protocol)) {
+      res.status(400).json({ error: 'Invalid href protocol' })
+      return
+    }
+
+    let upstream: Response
+    try {
+      upstream = await fetch(downloadUrl.toString(), {
+        headers: {
+          Accept: '*/*',
+          'User-Agent': 'med-systems/1.0',
+        },
+        signal: AbortSignal.timeout(60000),
+      })
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      const isZakupki = /(^|\.)zakupki\.gov\.ru$/i.test(downloadUrl.hostname)
+      // Some zakupki.gov.ru documents fail TLS chain validation in certain
+      // server environments. Fallback is scoped only to this host.
+      if (isZakupki) {
+        const insecure = await downloadWithInsecureTls(downloadUrl.toString(), 60000)
+        if (insecure.ok) {
+          res.setHeader('Content-Type', insecure.contentType)
+          res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(realName)}`)
+          res.send(insecure.data)
+          return
+        }
+        res.status(502).json({
+          error: `Attachment download failed: ${message}`,
+          details: insecure.error,
+        })
+        return
+      }
+      res.status(502).json({ error: `Attachment download failed: ${message}` })
+      return
+    }
 
     if (!upstream.ok) {
-      return res.status(502).json({ error: `Attachment download failed: ${upstream.status}` })
+      res.status(502).json({ error: `Attachment download failed: ${upstream.status}` })
+      return
     }
 
     const contentType = upstream.headers.get('content-type') ?? 'application/octet-stream'
     const data = Buffer.from(await upstream.arrayBuffer())
-
     res.setHeader('Content-Type', contentType)
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(realName)}`)
     res.send(data)
@@ -1888,6 +2592,58 @@ app.get('/api/bicotender/attachment', async (req, res) => {
     const message = e instanceof Error ? e.message : String(e)
     res.status(500).json({ error: message })
   }
+}
+
+async function downloadWithInsecureTls(
+  url: string,
+  timeoutMs: number,
+): Promise<{ ok: true; data: Buffer; contentType: string } | { ok: false; error: string }> {
+  return new Promise((resolve) => {
+    const req = https.request(
+      url,
+      {
+        method: 'GET',
+        headers: {
+          Accept: '*/*',
+          'User-Agent': 'med-systems/1.0',
+        },
+        rejectUnauthorized: false,
+      },
+      (resp) => {
+        const statusCode = Number(resp.statusCode ?? 0)
+        if (statusCode < 200 || statusCode >= 300) {
+          resolve({ ok: false, error: `Upstream status: ${statusCode || 'unknown'}` })
+          resp.resume()
+          return
+        }
+        const chunks: Buffer[] = []
+        resp.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
+        resp.on('end', () => {
+          resolve({
+            ok: true,
+            data: Buffer.concat(chunks),
+            contentType: resp.headers['content-type'] ?? 'application/octet-stream',
+          })
+        })
+      },
+    )
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error('timeout'))
+    })
+    req.on('error', (err) => {
+      resolve({ ok: false, error: err instanceof Error ? err.message : String(err) })
+    })
+    req.end()
+  })
+}
+
+// Keep legacy path for compatibility.
+app.get('/api/bicotender/attachment', async (req, res) => {
+  await proxyKonturAttachment(req, res)
+})
+
+app.get('/api/kontur/attachment', async (req, res) => {
+  await proxyKonturAttachment(req, res)
 })
 
 app.get('/api/tenders/get', async (req, res) => {
@@ -2005,15 +2761,44 @@ app.get('/api/tender-attachment', async (req, res) => {
       return res.status(400).json({ error: 'Invalid href protocol' })
     }
 
-    const upstream = await fetch(downloadUrl.toString(), {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-      signal: AbortSignal.timeout(60000),
-    })
+    const isTenderPlanHost = /(^|\.)tenderplan\.ru$/i.test(downloadUrl.hostname)
+    const isZakupkiHost = /(^|\.)zakupki\.gov\.ru$/i.test(downloadUrl.hostname)
+    let upstream: Response
+    try {
+      upstream = await fetch(downloadUrl.toString(), {
+        headers: {
+          ...(isTenderPlanHost ? { Authorization: `Bearer ${token}` } : {}),
+          Accept: '*/*',
+          'User-Agent': 'med-systems/1.0',
+        },
+        signal: AbortSignal.timeout(60000),
+      })
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      // zakupki.gov.ru frequently fails TLS chain validation on some servers.
+      // Use the same host-scoped insecure fallback as Kontur attachments.
+      if (isZakupkiHost) {
+        const insecure = await downloadWithInsecureTls(downloadUrl.toString(), 60000)
+        if (insecure.ok) {
+          res.setHeader('Content-Type', insecure.contentType)
+          res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(realName)}`)
+          res.send(insecure.data)
+          return
+        }
+        return res.status(502).json({
+          error: `Attachment download failed: ${message}`,
+          details: insecure.error,
+        })
+      }
+      return res.status(502).json({ error: `Attachment download failed: ${message}` })
+    }
 
     if (!upstream.ok) {
-      return res.status(502).json({ error: `Attachment download failed: ${upstream.status}` })
+      const details = await upstream.text().catch(() => '')
+      return res.status(502).json({
+        error: `Attachment download failed: ${upstream.status}`,
+        details: details.slice(0, 250),
+      })
     }
 
     const contentType = upstream.headers.get('content-type') ?? 'application/octet-stream'
@@ -2037,19 +2822,19 @@ app.post('/api/library/add', upload.single('file'), async (req, res) => {
     const originalFilename = clientFilename ?? f.originalname
     const fixedFilename = restoreUtf8FromLatin1(originalFilename)
     const extension = safeExtension(fixedFilename)
-    if (!['.pdf', '.doc', '.docx', '.xlsx', '.xls'].includes(extension)) {
+    if (!['.pdf', '.doc', '.docx', '.xlsx', '.xls', '.txt', '.csv', '.html', '.htm', '.json', '.xml'].includes(extension)) {
       return res.status(400).json({ error: 'Unsupported file type' })
     }
-
-    await fs.mkdir(LIB_DIR, { recursive: true })
-    const id = crypto.randomUUID()
-    const storedPath = path.join(LIB_DIR, `${id}-${fixedFilename}`)
-    await fs.writeFile(storedPath, f.buffer)
 
     const rows = await extractRowsFromFile({ buffer: f.buffer, filename: fixedFilename })
     if (rows.length === 0) {
       return res.status(400).json({ error: 'No rows detected in file (indicator/value)' })
     }
+    const extractedText = await extractTextFromFile({ buffer: f.buffer, filename: fixedFilename }).catch(() => '')
+    const normalizedTextHash = crypto
+      .createHash('sha256')
+      .update(String(extractedText).toLowerCase().replace(/\s+/g, ' ').trim())
+      .digest('hex')
 
     const indicatorEmbeddings = await embedTexts(rows.map((r) => r.indicator))
     for (let i = 0; i < rows.length; i++) {
@@ -2059,24 +2844,57 @@ app.post('/api/library/add', upload.single('file'), async (req, res) => {
     // Store a doc embedding as fallback/ranking.
     const docEmbedding = centroid(indicatorEmbeddings)
 
-    const doc: LibraryDoc = {
-      id,
-      originalFilename: fixedFilename,
-      extension,
-      storedPath,
-      docEmbedding,
-      rowsCount: rows.length,
-      rows,
-      indexedAt: new Date().toISOString(),
-    }
+    const committed = await withLibraryIndexLock(async () => {
+      const index = await loadIndex()
+      const duplicate = await findLibraryDuplicate({
+        docs: index.docs,
+        buffer: f.buffer,
+      })
+      if (duplicate) return { duplicate } as const
 
-    const index = await loadIndex()
-    index.docs.push(doc)
-    await saveIndex(index)
+      await fs.mkdir(LIB_DIR, { recursive: true })
+      const id = crypto.randomUUID()
+      const storedPath = path.join(LIB_DIR, `${id}-${fixedFilename}`)
+      await fs.writeFile(storedPath, f.buffer)
+
+      const doc: LibraryDoc = {
+        id,
+        originalFilename: fixedFilename,
+        extension,
+        storedPath,
+        contentHash: libraryContentHash(f.buffer),
+        normalizedTextHash,
+        extractedText,
+        docEmbedding,
+        embeddingModel:
+          String(process.env.EMBEDDINGS_PROVIDER ?? '').toLowerCase() === 'ollama'
+            ? `ollama:${process.env.OLLAMA_EMBEDDING_MODEL ?? 'nomic-embed-text'}`
+            : String(process.env.EMBEDDINGS_PROVIDER ?? '').toLowerCase() === 'openai'
+              ? `openai:${process.env.OPENAI_EMBEDDING_MODEL ?? 'text-embedding-3-small'}`
+              : `local:${process.env.LOCAL_EMBEDDING_MODEL ?? 'Xenova/all-MiniLM-L6-v2'}`,
+        pipelineVersion: 'match-pipeline-v2',
+        rowsCount: rows.length,
+        rows,
+        indexedAt: new Date().toISOString(),
+      }
+
+      index.docs.push(doc)
+      await saveIndex(index)
+      return { id, duplicate: null as null } as const
+    })
+
+    if (committed.duplicate) {
+      const duplicate = committed.duplicate
+      const message = `Такой же файл уже есть в библиотеке (id: ${duplicate.id.slice(0, 8)}…, «${duplicate.originalFilename}»)`
+      return res.status(409).json({
+        error: message,
+        duplicate,
+      })
+    }
 
     res.json({
       ok: true,
-      id,
+      id: committed.id,
       originalFilename,
       rows: rows.length,
     })
@@ -2096,6 +2914,10 @@ app.get('/api/library/list', async (_req, res) => {
         originalFilename: d.originalFilename,
         extension: d.extension,
         storedPath: d.storedPath,
+        contentHash: d.contentHash ?? null,
+        normalizedTextHash: d.normalizedTextHash ?? null,
+        embeddingModel: d.embeddingModel ?? null,
+        pipelineVersion: d.pipelineVersion ?? null,
         rowsCount: d.rowsCount ?? (Array.isArray((d as any).rows) ? (d as any).rows.length : null),
         indexedAt: d.indexedAt,
       })),
@@ -2111,17 +2933,21 @@ app.delete('/api/library/:id', async (req, res) => {
     const id = String(req.params.id ?? '').trim()
     if (!id) return res.status(400).json({ error: 'Missing document id' })
 
-    const index = await loadIndex()
-    const doc = index.docs.find((d) => d.id === id)
-    if (!doc) return res.status(404).json({ error: 'Document not found' })
+    const removed = await withLibraryIndexLock(async () => {
+      const index = await loadIndex()
+      const doc = index.docs.find((d) => d.id === id)
+      if (!doc) return false
 
-    // Remove physical file if present (best effort).
-    if (doc.storedPath && doc.storedPath.startsWith(LIB_DIR)) {
-      await fs.rm(doc.storedPath, { force: true })
-    }
+      // Remove physical file if present (best effort).
+      if (doc.storedPath && doc.storedPath.startsWith(LIB_DIR)) {
+        await fs.rm(doc.storedPath, { force: true })
+      }
 
-    index.docs = index.docs.filter((d) => d.id !== id)
-    await saveIndex(index)
+      index.docs = index.docs.filter((d) => d.id !== id)
+      await saveIndex(index)
+      return true
+    })
+    if (!removed) return res.status(404).json({ error: 'Document not found' })
     res.json({ ok: true, removedId: id })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
@@ -2131,9 +2957,11 @@ app.delete('/api/library/:id', async (req, res) => {
 
 app.post('/api/library/clear', async (_req, res) => {
   try {
-    const indexPath = path.join(process.cwd(), 'data', 'library-index.json')
-    await fs.rm(LIB_DIR, { recursive: true, force: true })
-    await fs.rm(indexPath, { force: true })
+    await withLibraryIndexLock(async () => {
+      const indexPath = path.join(process.cwd(), 'data', 'library-index.json')
+      await fs.rm(LIB_DIR, { recursive: true, force: true })
+      await fs.rm(indexPath, { force: true })
+    })
     res.json({ ok: true })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
@@ -2143,58 +2971,76 @@ app.post('/api/library/clear', async (_req, res) => {
 
 app.post('/api/library/reindexStored', async (_req, res) => {
   try {
-    await fs.mkdir(LIB_DIR, { recursive: true })
-    const allFiles = await fs.readdir(LIB_DIR)
-    const supported = new Set(['.pdf', '.doc', '.docx', '.xlsx', '.xls'])
-    const libraryFiles = allFiles
-      .map((name) => path.join(LIB_DIR, name))
-      .filter((p) => supported.has(path.extname(p).toLowerCase()))
+    const docsIndexed = await withLibraryIndexLock(async () => {
+      await fs.mkdir(LIB_DIR, { recursive: true })
+      const allFiles = await fs.readdir(LIB_DIR)
+      const supported = new Set(['.pdf', '.doc', '.docx', '.xlsx', '.xls', '.txt', '.csv', '.html', '.htm', '.json', '.xml'])
+      const libraryFiles = allFiles
+        .map((name) => path.join(LIB_DIR, name))
+        .filter((p) => supported.has(path.extname(p).toLowerCase()))
 
-    // Clear existing index; keep physical files.
-    const indexPath = path.join(process.cwd(), 'data', 'library-index.json')
-    await fs.rm(indexPath, { force: true })
+      // Clear existing index; keep physical files.
+      const indexPath = path.join(process.cwd(), 'data', 'library-index.json')
+      await fs.rm(indexPath, { force: true })
 
-    const docs: LibraryDoc[] = []
+      const docs: LibraryDoc[] = []
 
-    for (const storedPath of libraryFiles) {
-      const name = path.basename(storedPath)
-      // Try to parse stored format: <uuid>-<originalFilename>
-      const m = name.match(/^([0-9a-fA-F-]{36})-(.+)$/)
-      const id = m?.[1] ?? crypto.randomUUID()
-      const originalFilenameRaw = m?.[2] ?? name
-      const fixedFilename = restoreUtf8FromLatin1(originalFilenameRaw)
-      const extension = safeExtension(fixedFilename)
+      for (const storedPath of libraryFiles) {
+        const name = path.basename(storedPath)
+        // Try to parse stored format: <uuid>-<originalFilename>
+        const m = name.match(/^([0-9a-fA-F-]{36})-(.+)$/)
+        const id = m?.[1] ?? crypto.randomUUID()
+        const originalFilenameRaw = m?.[2] ?? name
+        const fixedFilename = restoreUtf8FromLatin1(originalFilenameRaw)
+        const extension = safeExtension(fixedFilename)
 
-      const buffer = await fs.readFile(storedPath)
-      const rows = await extractRowsFromFile({ buffer, filename: fixedFilename })
-      if (rows.length === 0) continue
+        const buffer = await fs.readFile(storedPath)
+        const rows = await extractRowsFromFile({ buffer, filename: fixedFilename })
+        if (rows.length === 0) continue
+        const extractedText = await extractTextFromFile({ buffer, filename: fixedFilename }).catch(() => '')
+        const normalizedTextHash = crypto
+          .createHash('sha256')
+          .update(String(extractedText).toLowerCase().replace(/\s+/g, ' ').trim())
+          .digest('hex')
 
-      const indicatorEmbeddings = await embedTexts(rows.map((r) => r.indicator))
-      for (let i = 0; i < rows.length; i++) {
-        ;(rows as any)[i] = { ...rows[i], embedding: indicatorEmbeddings[i] }
+        const indicatorEmbeddings = await embedTexts(rows.map((r) => r.indicator))
+        for (let i = 0; i < rows.length; i++) {
+          ;(rows as any)[i] = { ...rows[i], embedding: indicatorEmbeddings[i] }
+        }
+
+        const docEmbedding = centroid(indicatorEmbeddings)
+
+        docs.push({
+          id,
+          originalFilename: fixedFilename,
+          extension,
+          storedPath,
+          contentHash: libraryContentHash(buffer),
+          normalizedTextHash,
+          extractedText,
+          docEmbedding,
+          embeddingModel:
+            String(process.env.EMBEDDINGS_PROVIDER ?? '').toLowerCase() === 'ollama'
+              ? `ollama:${process.env.OLLAMA_EMBEDDING_MODEL ?? 'nomic-embed-text'}`
+              : String(process.env.EMBEDDINGS_PROVIDER ?? '').toLowerCase() === 'openai'
+                ? `openai:${process.env.OPENAI_EMBEDDING_MODEL ?? 'text-embedding-3-small'}`
+                : `local:${process.env.LOCAL_EMBEDDING_MODEL ?? 'Xenova/all-MiniLM-L6-v2'}`,
+          pipelineVersion: 'match-pipeline-v2',
+          rowsCount: rows.length,
+          rows: rows as any,
+          indexedAt: new Date().toISOString(),
+        })
       }
 
-      const docEmbedding = centroid(indicatorEmbeddings)
-
-      docs.push({
-        id,
-        originalFilename: fixedFilename,
-        extension,
-        storedPath,
-        docEmbedding,
-        rowsCount: rows.length,
-        rows: rows as any,
-        indexedAt: new Date().toISOString(),
+      await saveIndex({
+        version: 1,
+        createdAt: new Date().toISOString(),
+        docs,
       })
-    }
-
-    await saveIndex({
-      version: 1,
-      createdAt: new Date().toISOString(),
-      docs,
+      return docs.length
     })
 
-    res.json({ ok: true, docsIndexed: docs.length })
+    res.json({ ok: true, docsIndexed })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     res.status(500).json({ error: message })
@@ -2213,9 +3059,20 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     const customerName = asNonEmptyString(req.body?.customerName)
     const customerInn = asNonEmptyString(req.body?.customerInn)
     const auctionPrice = asNullableNumber(req.body?.auctionPrice)
+    const minMatchPercentForComplianceByRequest = asNullableNumber(req.body?.minMatchPercentForCompliance)
     const sourceUrl = asNonEmptyString(req.body?.sourceUrl)
+    const sendEmail = parseBooleanField(req.body?.sendEmail, true)
+    const sendCrm = parseBooleanField(req.body?.sendCrm, true)
+    const disableLlmByRequest = parseBooleanField(req.body?.disableLlm, false)
+    const forceAllLibraryCandidates = parseBooleanField(req.body?.forceAllLibraryCandidates, false)
+    const autoMode = parseBooleanField(req.body?.autoMode, false)
+    const notifyEmailRaw = asNonEmptyString(req.body?.notifyEmail)
+    if (notifyEmailRaw && !isValidEmail(notifyEmailRaw)) {
+      return res.status(400).json({ error: 'Invalid notifyEmail' })
+    }
+    const notifyEmail = notifyEmailRaw ?? MATCH_NOTIFY_EMAIL
     const extension = safeExtension(fixedFilename)
-    if (!['.pdf', '.doc', '.docx', '.xlsx', '.xls'].includes(extension)) {
+    if (!['.pdf', '.doc', '.docx', '.xlsx', '.xls', '.txt', '.csv', '.html', '.htm', '.json', '.xml'].includes(extension)) {
       return res.status(400).json({ error: 'Unsupported file type' })
     }
 
@@ -2229,6 +3086,36 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'No rows detected in uploaded file (indicator/value)' })
     }
     const analyzerInfo = detectAnalyzerInfoFromRows(queryRows as any)
+    const contractSignal = detectContractLikeDocument({ filename: fixedFilename, rows: queryRows as any })
+    if (contractSignal.isContractLike) {
+      return res.json({
+        ok: true,
+        embeddingMode:
+          String(process.env.EMBEDDINGS_PROVIDER ?? '').toLowerCase() === 'local'
+            ? 'local'
+            : process.env.OPENAI_API_KEY
+              ? 'openai'
+              : 'local',
+        thresholdUsed: Number(process.env.MATCH_PASS_PERCENT ?? 82),
+        indicatorSimilarityThresholdUsed: Number(process.env.MATCH_INDICATOR_SIM_THRESHOLD ?? 0.75),
+        decision: 'no_match',
+        bestScore: 0,
+        matchPercent: 0,
+        matchedCount: 0,
+        totalCount: 0,
+        bestMatchFilename: null,
+        rowResults: [],
+        llmDecision: null,
+        llmConfidence: null,
+        llmExplanation:
+          `Документ похож на проект контракта/юридический текст (contract-signal=${contractSignal.score}). ` +
+          'Сопоставление с библиотекой техописаний пропущено, чтобы избежать ложных совпадений.',
+        analyzerInfo,
+        crmNotification: { sent: false, reason: 'Skipped: contract-like document' },
+        emailNotification: { sent: false, reason: 'Skipped: contract-like document', recipient: notifyEmail },
+        matches: [],
+      })
+    }
 
     // First gate: product name must match between query file and library document (any of several parsed titles).
     const queryProductNames = extractNormalizedProductNamesFromRows(queryRows as any)
@@ -2248,9 +3135,17 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     const indicatorSimilarityThreshold = Number(process.env.MATCH_INDICATOR_SIM_THRESHOLD ?? 0.75)
     const passThresholdPercent = Number(process.env.MATCH_PASS_PERCENT ?? 82)
     const minCriteriaIfNameMatched = Number(process.env.MATCH_MIN_CRITERIA_IF_NAME_MATCH ?? 1)
-    const maxCandidateDocs = Number(process.env.MATCH_CANDIDATE_DOCS ?? 8)
-    const maxKeyRows = Number(process.env.MATCH_KEYVALUE_MAX_QUERY_ROWS ?? 40)
-    const maxLibraryRows = Number(process.env.MATCH_KEYVALUE_MAX_LIBRARY_ROWS ?? 300)
+    const maxCandidateDocs = forceAllLibraryCandidates
+      ? Number.POSITIVE_INFINITY
+      : autoMode
+        ? Math.max(1, Number(process.env.AUTO_MATCH_CANDIDATE_DOCS ?? 3))
+        : Math.max(1, Number(process.env.MATCH_CANDIDATE_DOCS ?? 8))
+    const maxKeyRows = autoMode
+      ? Math.max(1, Number(process.env.AUTO_MATCH_KEYVALUE_MAX_QUERY_ROWS ?? 20))
+      : Number(process.env.MATCH_KEYVALUE_MAX_QUERY_ROWS ?? 40)
+    const maxLibraryRows = autoMode
+      ? Math.max(1, Number(process.env.AUTO_MATCH_KEYVALUE_MAX_LIBRARY_ROWS ?? 120))
+      : Number(process.env.MATCH_KEYVALUE_MAX_LIBRARY_ROWS ?? 300)
 
     // Row-based decision; global centroid ranking is not used currently.
 
@@ -2385,7 +3280,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
       })
 
     // Optional Ollama semantic gate for product names (meaning-based matching).
-    if (String(process.env.JUDGE_PROVIDER ?? '').toLowerCase() === 'ollama') {
+    if (!autoMode && String(process.env.JUDGE_PROVIDER ?? '').toLowerCase() === 'ollama') {
       // Ollama roundtrips are expensive; call it only for best unresolved candidates.
       const maxDocsForOllamaNameGate = Number(process.env.MATCH_OLLAMA_NAME_GATE_MAX_DOCS ?? 3)
       const unresolved = (gatedWithNameDiagnostics as any[])
@@ -2418,6 +3313,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         }
       }
     }
+    const nameDiagnosticsBeforeGate = [...gatedWithNameDiagnostics]
     gatedWithNameDiagnostics = gatedWithNameDiagnostics.filter((x) => x.exactMatch || x.semanticMatch)
     // If query has explicit product codes and any candidates match by code,
     // keep only code-matched candidates.
@@ -2448,6 +3344,26 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     // This prevents cross-matching with semantically similar but different products.
     const exactNameDocs = gatedWithNameDiagnostics.filter((x: any) => Boolean(x?.exactMatch))
     if (exactNameDocs.length > 0) gatedWithNameDiagnostics = exactNameDocs
+    const allNameDiagByDocId = new Map(
+      libDocNames.map((x: any) => [
+        String(x?.doc?.id ?? ''),
+        {
+          exactMatch: false,
+          semanticMatch: false,
+          bestSimilarity: -1,
+        },
+      ]),
+    )
+    for (const x of nameDiagnosticsBeforeGate as any[]) {
+      const docId = String(x?.doc?.id ?? '')
+      if (!docId) continue
+      allNameDiagByDocId.set(docId, {
+        exactMatch: Boolean(x?.exactMatch),
+        semanticMatch: Boolean(x?.semanticMatch),
+        bestSimilarity: Number.isFinite(Number(x?.bestSimilarity)) ? Number(x?.bestSimilarity) : -1,
+      })
+    }
+
     const nameDiagByDocId = new Map(
       gatedWithNameDiagnostics.map((x: any) => [
         String(x?.doc?.id ?? ''),
@@ -2463,7 +3379,16 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     if (gatedCandidateDocs.length === 0) {
       // Fallback: do not fail hard on product-name gate.
       // Some tender files have noisy/partial names, while key parameters still match.
-      gatedCandidateDocs = candidateDocs
+      const byNameSimilarity = candidateDocs
+        .map((doc) => ({
+          doc,
+          bestSimilarity: Number(allNameDiagByDocId.get(String((doc as any)?.id ?? ''))?.bestSimilarity ?? -1),
+        }))
+        .sort((a, b) => b.bestSimilarity - a.bestSimilarity)
+      const topSimilarity = Number(byNameSimilarity[0]?.bestSimilarity ?? -1)
+      const similarityFloor = Number.isFinite(topSimilarity) && topSimilarity > 0 ? Math.max(0.45, topSimilarity - 0.08) : -1
+      const narrowed = byNameSimilarity.filter((x) => x.bestSimilarity >= similarityFloor).map((x) => x.doc)
+      gatedCandidateDocs = narrowed.length > 0 ? narrowed : byNameSimilarity.map((x) => x.doc)
     }
     if (gatedCandidateDocs.length === 0) {
       const libraryNameSamples = libDocNames.slice(0, 12).map(({ doc, names, fileHint, namesForGate }) => {
@@ -2530,32 +3455,99 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
       })
     }
 
-    // 1) Fast coarse ranking using docEmbedding vs query centroid.
+    const libDocNameMap = new Map(
+      libDocNames.map((item) => [String(item.doc.id), { namesForGate: item.namesForGate, fileHint: item.fileHint }]),
+    )
+
+    // 1) Hybrid coarse ranking (docEmbedding + lexical recall over keywords).
     const queryVectors = queryRows
       .filter((r) => !isExcludedFromParameterMatch(r.indicator))
       .map((r) => r.embedding)
       .filter((v) => Array.isArray(v)) as number[][]
     const queryDocEmbedding = queryVectors.length > 0 ? centroid(queryVectors) : null
+    const queryKeywordTokens = toKeywordTokenSet([
+      ...queryRows.map((r) => String(r.indicator ?? '')),
+      ...queryNamesForGate,
+      ...queryCodes,
+      ...queryMarkers,
+    ])
 
-    const rankedByDocEmbedding: Array<{ doc: LibraryDoc; docScore: number }> = queryDocEmbedding
+    const rankedAll: Array<{ doc: LibraryDoc; docScore: number; lexicalScore: number }> = queryDocEmbedding
       ? gatedCandidateDocs
           .map((doc) => {
-            const emb = (doc as any).docEmbedding
+            const embFromDoc = (doc as any).docEmbedding
+            const embFromRows =
+              Array.isArray((doc as any)?.rows) && (doc as any).rows.length > 0
+                ? centroid(
+                    (doc as any).rows
+                      .map((r: any) => r?.embedding)
+                      .filter((v: unknown) => Array.isArray(v)) as number[][],
+                  )
+                : null
+            const emb = Array.isArray(embFromDoc) ? embFromDoc : embFromRows
             const docScore = Array.isArray(emb) ? cosineSimilarity(queryDocEmbedding, emb) : -Infinity
-            return { doc, docScore }
+            const nameMeta = libDocNameMap.get(String((doc as any)?.id ?? ''))
+            const docKeywordTokens = toKeywordTokenSet([
+              ...(((doc as any)?.rows ?? []) as any[]).map((r) => String(r?.indicator ?? '')),
+              ...(Array.isArray(nameMeta?.namesForGate) ? nameMeta.namesForGate : []),
+              String(nameMeta?.fileHint ?? ''),
+              String((doc as any)?.originalFilename ?? ''),
+            ])
+            const lexicalScore = keywordTokenRecall(queryKeywordTokens, docKeywordTokens)
+            return { doc, docScore, lexicalScore }
           })
           .sort((a, b) => b.docScore - a.docScore)
-          .slice(0, maxCandidateDocs)
-      : gatedCandidateDocs.slice(0, maxCandidateDocs).map((doc) => ({ doc, docScore: -Infinity }))
+      : gatedCandidateDocs.map((doc) => {
+          const nameMeta = libDocNameMap.get(String((doc as any)?.id ?? ''))
+          const docKeywordTokens = toKeywordTokenSet([
+            ...(((doc as any)?.rows ?? []) as any[]).map((r) => String(r?.indicator ?? '')),
+            ...(Array.isArray(nameMeta?.namesForGate) ? nameMeta.namesForGate : []),
+            String(nameMeta?.fileHint ?? ''),
+            String((doc as any)?.originalFilename ?? ''),
+          ])
+          const lexicalScore = keywordTokenRecall(queryKeywordTokens, docKeywordTokens)
+          return { doc, docScore: -Infinity, lexicalScore }
+        })
+
+    const rankByDocEmbedding = new Map<string, number>()
+    for (let i = 0; i < rankedAll.length; i++) rankByDocEmbedding.set(String(rankedAll[i].doc.id), i + 1)
+    const rankedByLexical = [...rankedAll].sort((a, b) => b.lexicalScore - a.lexicalScore)
+    const rankByLexical = new Map<string, number>()
+    for (let i = 0; i < rankedByLexical.length; i++) rankByLexical.set(String(rankedByLexical[i].doc.id), i + 1)
+    const rrfK = 50
+    const rankedHybrid = [...rankedAll]
+      .map((item) => {
+        const id = String(item.doc.id)
+        const embRank = rankByDocEmbedding.get(id) ?? rankedAll.length + 1
+        const lexRank = rankByLexical.get(id) ?? rankedAll.length + 1
+        const rrfScore =
+          (Number.isFinite(item.docScore) ? 1 / (rrfK + embRank) : 0) + 1 / (rrfK + lexRank) + item.lexicalScore * 0.15
+        return { ...item, rrfScore }
+      })
+      .sort((a, b) => b.rrfScore - a.rrfScore)
+
+    const rankedByDocEmbedding: Array<{ doc: LibraryDoc; docScore: number; lexicalScore: number }> = Number.isFinite(
+      maxCandidateDocs,
+    )
+      ? rankedHybrid.slice(0, maxCandidateDocs)
+      : rankedHybrid
 
     // 2) Expensive key-value scoring only for top candidates.
     const scoredDocs = rankedByDocEmbedding
-      .map(({ doc }) => {
+      .map(({ doc, docScore, lexicalScore }) => {
         const libRows = Array.isArray(doc.rows) ? doc.rows : []
         const libRowsWithEmb = libRows.filter((r: any) => Array.isArray((r as any).embedding))
 
         if (libRowsWithEmb.length === 0) {
-          return { doc, score: -Infinity, matchedCount: 0, totalCount: 0, matchedKeys: [] as string[] }
+          return {
+            doc,
+            docScore,
+            lexicalScore,
+            score: -Infinity,
+            matchedCount: 0,
+            totalCount: 0,
+            matchedKeys: [] as string[],
+          }
         }
 
         // Pre-filter library rows by similarity to query centroid (cuts O(N*M)).
@@ -2583,10 +3575,14 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         })
 
         const score = prop.totalPossible > 0 ? prop.points / prop.totalPossible : 0
-        const nameDiag = nameDiagByDocId.get(String((doc as any)?.id ?? ''))
+        const nameDiag =
+          nameDiagByDocId.get(String((doc as any)?.id ?? '')) ??
+          allNameDiagByDocId.get(String((doc as any)?.id ?? ''))
         const gateDiag = gatedWithNameDiagnostics.find((x: any) => String(x?.doc?.id ?? '') === String((doc as any)?.id ?? '')) as any
         return {
           doc,
+          docScore,
+          lexicalScore,
           score,
           matchedCount: prop.points,
           totalCount: prop.totalPossible,
@@ -2610,10 +3606,188 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         const aNameSim = Number.isFinite(Number(a.nameSimilarity)) ? Number(a.nameSimilarity) : -1
         const bNameSim = Number.isFinite(Number(b.nameSimilarity)) ? Number(b.nameSimilarity) : -1
         if (bNameSim !== aNameSim) return bNameSim - aNameSim
+        if (b.docScore !== a.docScore) return b.docScore - a.docScore
+        if (b.lexicalScore !== a.lexicalScore) return b.lexicalScore - a.lexicalScore
         return 0
       })
 
-    const heuristicBest = scoredDocs[0]
+    const buildMatchedRowResultsForDoc = (doc: LibraryDoc): any[] => {
+      const selectedDoc = doc as any
+      if (!selectedDoc || !Array.isArray(selectedDoc.rows) || !selectedDoc.rows?.length) return []
+      const libRowsWithEmb = selectedDoc.rows.filter(
+        (r: any) => Array.isArray(r.embedding) && !isExcludedFromParameterMatch(r.indicator),
+      )
+      if (libRowsWithEmb.length === 0) return []
+      const queryRowsForResults = (queryRows as any[]).filter((r) => !isExcludedFromParameterMatch(r.indicator))
+
+      const rows = queryRowsForResults
+        .map((qRow) => {
+          const qEmb = qRow.embedding as number[]
+          let bestSimAll = -Infinity
+          let bestLibAll: any = null
+          let bestSimValueMatch = -Infinity
+          let bestLibValueMatch: any = null
+
+          for (const lRow of libRowsWithEmb as any[]) {
+            const s = cosineSimilarity(qEmb, lRow.embedding as number[])
+            if (s > bestSimAll) {
+              bestSimAll = s
+              bestLibAll = lRow
+            }
+
+            const aliasPair = tenderAliasesAllowValueCompare(qRow.indicator, lRow.indicator)
+            const keywordSimilar = indicatorsLookKeywordSimilar(qRow.indicator, lRow.indicator)
+            if (s < indicatorSimilarityThreshold && !aliasPair && !keywordSimilar) continue
+
+            const m = valuesMatch({
+              queryValueRaw: qRow.valueRaw,
+              libraryValueRaw: lRow.valueRaw,
+              toleranceRel: Number(process.env.MATCH_VALUE_TOLERANCE_REL ?? 0.1),
+              toleranceAbs: Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0),
+            })
+            const fallbackTextMatch =
+              aliasPair &&
+              ((
+                indicatorLooksComposition(qRow.indicator) &&
+                indicatorLooksComposition(lRow.indicator)
+              ) ||
+                (indicatorLooksPurposeOrDescription(qRow.indicator) &&
+                  indicatorLooksPurposeOrDescription(lRow.indicator))) &&
+              compositionLongTextFallbackMatch(qRow.valueRaw, lRow.valueRaw)
+
+            if ((m.match || fallbackTextMatch) && s > bestSimValueMatch) {
+              bestSimValueMatch = s
+              bestLibValueMatch = lRow
+            }
+          }
+
+          const chosenLib = bestLibValueMatch ?? bestLibAll
+          const m = chosenLib
+            ? valuesMatch({
+                queryValueRaw: qRow.valueRaw,
+                libraryValueRaw: chosenLib.valueRaw,
+                toleranceRel: Number(process.env.MATCH_VALUE_TOLERANCE_REL ?? 0.1),
+                toleranceAbs: Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0),
+              })
+            : { match: false, reason: 'no candidate' }
+          const fallbackTextMatch =
+            chosenLib != null &&
+            tenderAliasesAllowValueCompare(qRow.indicator, chosenLib.indicator) &&
+            ((
+              indicatorLooksComposition(qRow.indicator) &&
+              indicatorLooksComposition(chosenLib.indicator)
+            ) ||
+              (indicatorLooksPurposeOrDescription(qRow.indicator) &&
+                indicatorLooksPurposeOrDescription(chosenLib.indicator))) &&
+            compositionLongTextFallbackMatch(qRow.valueRaw, chosenLib.valueRaw)
+
+          const bestSimForIndicatorOk = chosenLib === bestLibValueMatch ? bestSimValueMatch : bestSimAll
+          const keywordSimilar = chosenLib ? indicatorsLookKeywordSimilar(qRow.indicator, chosenLib.indicator) : false
+          const indicatorOk =
+            bestSimForIndicatorOk >= indicatorSimilarityThreshold ||
+            (chosenLib != null &&
+              (tenderAliasesAllowValueCompare(qRow.indicator, chosenLib.indicator) || keywordSimilar))
+          const valueOk = Boolean(m.match || fallbackTextMatch)
+
+          return {
+            indicator: qRow.indicator,
+            queryValueRaw: qRow.valueRaw,
+            matchedLibraryIndicator: chosenLib?.indicator,
+            matchedLibraryValueRaw: chosenLib?.valueRaw,
+            indicatorSimilarity: bestSimForIndicatorOk,
+            valueMatch: valueOk,
+            indicatorOk,
+            valueReason: m.match ? m.reason : fallbackTextMatch ? 'composition long-text fallback' : m.reason,
+            rowMatched: indicatorOk && valueOk,
+          }
+        })
+        .filter((r) => Boolean(r.rowMatched))
+
+      return rows
+    }
+
+    const refinementTopDocs = autoMode
+      ? Math.max(1, Number(process.env.AUTO_MATCH_REFINEMENT_TOP_DOCS ?? 2))
+      : Math.max(1, Number(process.env.MATCH_REFINEMENT_TOP_DOCS ?? 5))
+    const refinedTopDocs = scoredDocs.slice(0, refinementTopDocs).map((item) => {
+      const refinedRowResults = buildMatchedRowResultsForDoc(item.doc)
+      return {
+        ...item,
+        refinedRowResults,
+        refinedMatchedCount: refinedRowResults.length,
+      }
+    })
+
+    const refinementBest =
+      refinedTopDocs
+        .slice()
+        .sort((a, b) => {
+          if (b.refinedMatchedCount !== a.refinedMatchedCount) return b.refinedMatchedCount - a.refinedMatchedCount
+          if (b.matchedCount !== a.matchedCount) return b.matchedCount - a.matchedCount
+          if (b.score !== a.score) return b.score - a.score
+          return b.docScore - a.docScore
+        })[0] ?? null
+
+    let heuristicBest = refinementBest ?? scoredDocs[0]
+    let pipelineDecisionExplanation: string | null = null
+    try {
+      const pipelineEnabled = String(process.env.MATCH_PIPELINE_ENABLED ?? 'true') === 'true'
+      if (pipelineEnabled) {
+        const pipelineCandidateCount = autoMode
+          ? Math.max(2, Number(process.env.AUTO_MATCH_PIPELINE_CANDIDATES ?? 4))
+          : Math.max(2, Number(process.env.MATCH_PIPELINE_CANDIDATES ?? 10))
+        const pipelineCandidatesRaw = scoredDocs.slice(0, pipelineCandidateCount)
+        if (pipelineCandidatesRaw.length > 0) {
+          const queryParsed = await matchingRuntime.fileParser.parse({
+            filename: fixedFilename,
+            sizeBytes: f.buffer.length,
+            buffer: Buffer.from(f.buffer),
+          })
+          const pipelineCandidatesParsed = await Promise.all(
+            pipelineCandidatesRaw.map(async (item) => {
+              try {
+                const fileBuffer = await fs.readFile(item.doc.storedPath)
+                return await matchingRuntime.fileParser.parse({
+                  filename: item.doc.originalFilename,
+                  sizeBytes: fileBuffer.length,
+                  buffer: fileBuffer,
+                })
+              } catch {
+                const fallbackText = Array.isArray((item.doc as any)?.rows)
+                  ? (item.doc as any).rows
+                      .map((r: any) => `${String(r?.indicator ?? '')}: ${String(r?.valueRaw ?? '')}`)
+                      .join('\n')
+                  : ''
+                const fallbackBuffer = Buffer.from(fallbackText, 'utf8')
+                return await matchingRuntime.fileParser.parse({
+                  filename: item.doc.originalFilename,
+                  sizeBytes: fallbackBuffer.length,
+                  buffer: fallbackBuffer,
+                })
+              }
+            }),
+          )
+          const pipelineBest = await matchingRuntime.pipeline.compare(queryParsed, pipelineCandidatesParsed)
+          if (pipelineBest) {
+            pipelineDecisionExplanation = pipelineBest.decision.explanation
+            const boosted = scoredDocs.find((x) => x.doc.id === pipelineBest.document.id)
+            if (boosted) {
+              const boostFactor = Number(process.env.MATCH_PIPELINE_BOOST_FACTOR ?? 0.35)
+              heuristicBest = {
+                ...boosted,
+                score: Math.max(boosted.score, boosted.score + pipelineBest.decision.confidence * boostFactor),
+                refinedMatchedCount: Math.max(
+                  Number((boosted as any).refinedMatchedCount ?? 0),
+                  Math.round(pipelineBest.decision.scores.coverageAByB * Math.max(1, queryRows.length)),
+                ),
+              } as any
+            }
+          }
+        }
+      }
+    } catch {
+      // Keep primary matching flow resilient if secondary pipeline fails.
+    }
     // LLM judge step (neural network) for final decision.
     // For speed we can skip LLM when heuristic already reached required matched criteria.
     // This dramatically reduces latency on local Ollama models.
@@ -2622,8 +3796,12 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     let llm: { decision: JudgeDecision; confidence: number; similarity: number; explanation: string } | null = null
     let llmError: string | null = null
     const judgeProvider = String(process.env.JUDGE_PROVIDER ?? '').toLowerCase()
-    const heuristicEnough = heuristicBest.matchedCount >= minCriteriaIfNameMatched
-    const disableLlm = String(process.env.MATCH_DISABLE_LLM ?? 'false') === 'true'
+    const heuristicMatchedCount = Math.max(
+      Number((heuristicBest as any)?.matchedCount ?? 0),
+      Number((heuristicBest as any)?.refinedMatchedCount ?? 0),
+    )
+    const heuristicEnough = heuristicMatchedCount >= minCriteriaIfNameMatched
+    const disableLlm = disableLlmByRequest || String(process.env.MATCH_DISABLE_LLM ?? 'false') === 'true'
     const shouldRunLlm = !disableLlm && !(skipLlmWhenHeuristicConfident && heuristicEnough)
     if (shouldRunLlm) {
       try {
@@ -2683,7 +3861,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     // Prefer deterministic heuristic when it already meets criteria.
     // This avoids false "no_match" from LLM on partially-structured tender docs.
     const decisionByCriteriaIfNameMatched: JudgeDecision =
-      heuristicBest.matchedCount >= minCriteriaIfNameMatched ? 'match' : 'no_match'
+      heuristicMatchedCount >= minCriteriaIfNameMatched ? 'match' : 'no_match'
     const llmContradictsStrongHeuristic =
       judgeProvider === 'ollama' &&
       heuristicEnough &&
@@ -2696,107 +3874,19 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         : decisionByCriteriaIfNameMatched
 
     // Build row-level explanation for the selected document only.
-    let rowResults: any[] = []
-    const selectedDoc = selected.doc as any
-    if (selectedDoc && Array.isArray(selectedDoc.rows) && selectedDoc.rows?.length) {
-      const libRowsWithEmb = selectedDoc.rows.filter(
-        (r: any) => Array.isArray(r.embedding) && !isExcludedFromParameterMatch(r.indicator),
-      )
-      if (libRowsWithEmb.length > 0) {
-        const queryRowsForResults = (queryRows as any[]).filter(
-          (r) => !isExcludedFromParameterMatch(r.indicator),
-        )
-        rowResults = queryRowsForResults.map((qRow) => {
-          const qEmb = qRow.embedding as number[]
-          let bestSimAll = -Infinity
-          let bestLibAll: any = null
-          let bestSimValueMatch = -Infinity
-          let bestLibValueMatch: any = null
-
-          for (const lRow of libRowsWithEmb as any[]) {
-            const s = cosineSimilarity(qEmb, lRow.embedding as number[])
-            if (s > bestSimAll) {
-              bestSimAll = s
-              bestLibAll = lRow
-            }
-
-            const aliasPair = tenderAliasesAllowValueCompare(qRow.indicator, lRow.indicator)
-            if (s < indicatorSimilarityThreshold && !aliasPair) continue
-
-            const m = valuesMatch({
-              queryValueRaw: qRow.valueRaw,
-              libraryValueRaw: lRow.valueRaw,
-              toleranceRel: Number(process.env.MATCH_VALUE_TOLERANCE_REL ?? 0.1),
-              toleranceAbs: Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0),
-            })
-            const fallbackTextMatch =
-              aliasPair &&
-              ((
-                indicatorLooksComposition(qRow.indicator) &&
-                indicatorLooksComposition(lRow.indicator)
-              ) ||
-                (indicatorLooksPurposeOrDescription(qRow.indicator) &&
-                  indicatorLooksPurposeOrDescription(lRow.indicator))) &&
-              compositionLongTextFallbackMatch(qRow.valueRaw, lRow.valueRaw)
-
-            if ((m.match || fallbackTextMatch) && s > bestSimValueMatch) {
-              bestSimValueMatch = s
-              bestLibValueMatch = lRow
-            }
-          }
-
-          const chosenLib = bestLibValueMatch ?? bestLibAll
-          const m = chosenLib
-            ? valuesMatch({
-                queryValueRaw: qRow.valueRaw,
-                libraryValueRaw: chosenLib.valueRaw,
-                toleranceRel: Number(process.env.MATCH_VALUE_TOLERANCE_REL ?? 0.1),
-                toleranceAbs: Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0),
-              })
-            : { match: false, reason: 'no candidate' }
-          const fallbackTextMatch =
-            chosenLib != null &&
-            tenderAliasesAllowValueCompare(qRow.indicator, chosenLib.indicator) &&
-            ((
-              indicatorLooksComposition(qRow.indicator) &&
-              indicatorLooksComposition(chosenLib.indicator)
-            ) ||
-              (indicatorLooksPurposeOrDescription(qRow.indicator) &&
-                indicatorLooksPurposeOrDescription(chosenLib.indicator))) &&
-            compositionLongTextFallbackMatch(qRow.valueRaw, chosenLib.valueRaw)
-
-          const bestSimForIndicatorOk = chosenLib === bestLibValueMatch ? bestSimValueMatch : bestSimAll
-          const indicatorOk =
-            bestSimForIndicatorOk >= indicatorSimilarityThreshold ||
-            (chosenLib != null && tenderAliasesAllowValueCompare(qRow.indicator, chosenLib.indicator))
-          const valueOk = Boolean(m.match || fallbackTextMatch)
-
-          return {
-            indicator: qRow.indicator,
-            queryValueRaw: qRow.valueRaw,
-            matchedLibraryIndicator: chosenLib?.indicator,
-            matchedLibraryValueRaw: chosenLib?.valueRaw,
-            indicatorSimilarity: bestSimForIndicatorOk,
-            valueMatch: valueOk,
-            indicatorOk,
-            valueReason: m.match
-              ? m.reason
-              : fallbackTextMatch
-                ? 'composition long-text fallback'
-                : m.reason,
-            rowMatched: indicatorOk && valueOk,
-          }
-        })
-        // User-facing output: show only actual matched criteria for the selected file.
-        rowResults = rowResults.filter((r) => Boolean(r.rowMatched))
-      }
-    }
+    const rowResults: any[] = Array.isArray((selected as any).refinedRowResults)
+      ? ((selected as any).refinedRowResults as any[])
+      : buildMatchedRowResultsForDoc(selected.doc)
 
     const matchedCountByRows = rowResults.length
     const matchedCountOut = Math.max(selected.matchedCount, matchedCountByRows)
     const rawMatchPercentOut =
       selected.totalCount > 0 ? (matchedCountOut / selected.totalCount) * 100 : 0
-    const minMatchPercentForCompliance = Number(process.env.MATCH_MIN_PERCENT_FOR_COMPLIANCE ?? 30)
+    const minMatchPercentForComplianceDefault = Number(process.env.MATCH_MIN_PERCENT_FOR_COMPLIANCE ?? 30)
+    const minMatchPercentForCompliance = clampPercent(
+      minMatchPercentForComplianceByRequest ?? minMatchPercentForComplianceDefault,
+      30,
+    )
     const belowMinPercent = rawMatchPercentOut < minMatchPercentForCompliance
     const decisionOut: JudgeDecision = belowMinPercent
       ? 'no_match'
@@ -2804,22 +3894,33 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         ? 'match'
         : decision
     const matchPercentOut = rawMatchPercentOut
+    const notificationPayload: MatchNotificationPayload = {
+      recipientEmail: notifyEmail,
+      auctionNumber,
+      customerName,
+      customerInn,
+      auctionPrice,
+      sourceUrl,
+      decision: decisionOut,
+      uploadedFilename: fixedFilename,
+      bestMatchFilename: selected.doc?.originalFilename ?? null,
+      matchedCount: matchedCountOut,
+      totalCount: selected.totalCount,
+      matchPercent: matchPercentOut,
+    }
+    const crmNotification =
+      !sendCrm
+        ? { sent: false, reason: 'Skipped: disabled by user' }
+        : decisionOut === 'match'
+          ? await sendMatchNotificationToCrm(notificationPayload)
+          : { sent: false, reason: 'Skipped: decision is no_match' }
+
     const emailNotification =
-      decisionOut === 'match'
-        ? await sendMatchNotificationEmail({
-            auctionNumber,
-            customerName,
-            customerInn,
-            auctionPrice,
-            sourceUrl,
-            decision: decisionOut,
-            uploadedFilename: fixedFilename,
-            bestMatchFilename: selected.doc?.originalFilename ?? null,
-            matchedCount: matchedCountOut,
-            totalCount: selected.totalCount,
-            matchPercent: matchPercentOut,
-          })
-        : { sent: false, reason: 'Skipped: decision is no_match' }
+      !sendEmail
+        ? { sent: false, reason: 'Skipped: disabled by user', recipient: notifyEmail }
+        : decisionOut === 'match'
+        ? await sendMatchNotificationEmail(notificationPayload)
+        : { sent: false, reason: 'Skipped: decision is no_match', recipient: notifyEmail }
 
     res.json({
       ok: true,
@@ -2843,8 +3944,13 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
       llmConfidence: llm?.confidence ?? null,
       llmSimilarity: llm?.similarity ?? null,
       llmExplanation:
-        llm?.explanation && llm.explanation.trim().length > 0 ? llm.explanation : llmError ?? null,
+        llm?.explanation && llm.explanation.trim().length > 0
+          ? llm.explanation
+          : pipelineDecisionExplanation
+            ? `${pipelineDecisionExplanation}${llmError ? ` | ${llmError}` : ''}`
+            : llmError ?? null,
       analyzerInfo,
+      crmNotification,
       emailNotification,
       // We return only the best matching document.
       matches:
@@ -2867,10 +3973,628 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
   }
 })
 
+type AutoMatchIntervalCode = '3m' | '5m' | '10m' | '30m' | '60m'
+
+type AutoMatchRunItem = {
+  timestamp: string
+  keyId: string
+  tenderId: string
+  attachmentName: string
+  status: 'matched' | 'no_match' | 'skipped' | 'error'
+  message?: string
+  matchPercent?: number
+  bestMatchFilename?: string | null
+}
+
+type AutoMatchCurrentItem = {
+  stage: 'keys' | 'tenders' | 'tender_details' | 'attachment_download' | 'matching'
+  keyId?: string
+  tenderId?: string
+  attachmentName?: string
+  updatedAt: string
+}
+
+type AutoMatchState = {
+  enabled: boolean
+  interval: AutoMatchIntervalCode
+  running: boolean
+  currentRunStartedAt: string | null
+  lastRunAt: string | null
+  lastRunFinishedAt: string | null
+  stats: {
+    processed: number
+    matched: number
+    noMatch: number
+    skipped: number
+    errors: number
+  }
+  currentItem: AutoMatchCurrentItem | null
+  history: AutoMatchRunItem[]
+}
+
+const AUTO_MATCH_INTERVALS_MS: Record<AutoMatchIntervalCode, number> = {
+  '3m': 3 * 60 * 1000,
+  '5m': 5 * 60 * 1000,
+  '10m': 10 * 60 * 1000,
+  '30m': 30 * 60 * 1000,
+  '60m': 60 * 60 * 1000,
+}
+
+const DEFAULT_AUTO_MATCH_STATE: AutoMatchState = {
+  enabled: false,
+  interval: '10m',
+  running: false,
+  currentRunStartedAt: null,
+  lastRunAt: null,
+  lastRunFinishedAt: null,
+  stats: {
+    processed: 0,
+    matched: 0,
+    noMatch: 0,
+    skipped: 0,
+    errors: 0,
+  },
+  currentItem: null,
+  history: [],
+}
+
+let autoMatchState: AutoMatchState = { ...DEFAULT_AUTO_MATCH_STATE }
+let autoMatchTimer: NodeJS.Timeout | null = null
+let autoMatchRunInProgress = false
+
+function autoMatchStatePath(): string {
+  return autoDataPath('auto-match-state.json')
+}
+
+async function loadAutoMatchState(): Promise<void> {
+  try {
+    const p = autoMatchStatePath()
+    const text = await fs.readFile(p, 'utf8')
+    const parsed = JSON.parse(text) as Partial<AutoMatchState>
+    const interval = (parsed.interval ?? DEFAULT_AUTO_MATCH_STATE.interval) as AutoMatchIntervalCode
+    autoMatchState = {
+      ...DEFAULT_AUTO_MATCH_STATE,
+      ...parsed,
+      interval: Object.keys(AUTO_MATCH_INTERVALS_MS).includes(interval) ? interval : DEFAULT_AUTO_MATCH_STATE.interval,
+      running: false,
+      currentRunStartedAt: null,
+      lastRunFinishedAt:
+        typeof parsed.lastRunFinishedAt === 'string'
+          ? parsed.lastRunFinishedAt
+          : typeof parsed.lastRunAt === 'string'
+            ? parsed.lastRunAt
+            : null,
+      currentItem:
+        parsed.currentItem && typeof parsed.currentItem === 'object'
+          ? {
+              stage: String((parsed.currentItem as any).stage ?? 'keys') as AutoMatchCurrentItem['stage'],
+              keyId: asNonEmptyString((parsed.currentItem as any).keyId) ?? undefined,
+              tenderId: asNonEmptyString((parsed.currentItem as any).tenderId) ?? undefined,
+              attachmentName: asNonEmptyString((parsed.currentItem as any).attachmentName) ?? undefined,
+              updatedAt: asNonEmptyString((parsed.currentItem as any).updatedAt) ?? new Date().toISOString(),
+            }
+          : null,
+      history: Array.isArray(parsed.history) ? (parsed.history as AutoMatchRunItem[]).slice(-200) : [],
+      stats: { ...DEFAULT_AUTO_MATCH_STATE.stats, ...(parsed.stats ?? {}) },
+    }
+  } catch {
+    autoMatchState = { ...DEFAULT_AUTO_MATCH_STATE }
+  }
+}
+
+async function saveAutoMatchState(): Promise<void> {
+  const p = autoMatchStatePath()
+  await fs.mkdir(path.dirname(p), { recursive: true })
+  await fs.writeFile(p, JSON.stringify(autoMatchState), 'utf8')
+}
+
+function autoMatchBaseUrl(): string {
+  const p = Number(process.env.PORT ?? 3001)
+  return `http://127.0.0.1:${p}`
+}
+
+function autoMatchPushHistory(item: AutoMatchRunItem): void {
+  autoMatchState.history.push(item)
+  if (autoMatchState.history.length > 200) {
+    autoMatchState.history = autoMatchState.history.slice(-200)
+  }
+}
+
+async function readHttpErrorMessage(resp: Response): Promise<string> {
+  try {
+    const json: any = await resp.json().catch(() => null)
+    const msg =
+      (typeof json?.error === 'string' && json.error.trim().length > 0 ? json.error.trim() : null) ??
+      (typeof json?.message === 'string' && json.message.trim().length > 0 ? json.message.trim() : null)
+    if (msg) return msg.slice(0, 250)
+  } catch {
+    // ignore JSON parse issues
+  }
+
+  try {
+    const text = await resp.text()
+    if (text && text.trim().length > 0) return text.trim().slice(0, 250)
+  } catch {
+    // ignore text read issues
+  }
+
+  return ''
+}
+
+function stopAutoMatchScheduler(): void {
+  if (autoMatchTimer) {
+    clearInterval(autoMatchTimer)
+    autoMatchTimer = null
+  }
+}
+
+function startAutoMatchScheduler(): void {
+  stopAutoMatchScheduler()
+  const ms = AUTO_MATCH_INTERVALS_MS[autoMatchState.interval]
+  autoMatchTimer = setInterval(() => {
+    void runAutoMatchCycle('interval')
+  }, ms)
+}
+
+async function fetchAutoMatchAllKeys(): Promise<Array<{ _id: string; name: string; Text: string[]; Exclude: string[] }>> {
+  const token =
+    process.env.TENDERPLAN_API_TOKEN ??
+    'f6cf879e0113dc709cb929e4281a9f54b21a5ef6b3e4190523837650d2c1e0995ad31d17524739a5c011c7b0255e33e994daee02249d6eb4a530e22132bc2116'
+
+  try {
+    const upstream = await fetch('https://tenderplan.ru/api/keys/getall', {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(15000),
+    })
+    const json = await upstream.json().catch(() => null)
+    if (upstream.ok) {
+      const rawList = Array.isArray(json) ? json : Array.isArray((json as any)?.data) ? (json as any).data : []
+      const list = normalizeTenderKeyItems(rawList)
+      await writeCachedTenderKeys(list)
+      return list
+    }
+  } catch {
+    // fallback to cache below
+  }
+
+  const cached = await readCachedTenderKeys()
+  if (cached && cached.length > 0) return cached
+  return buildLocalTenderKeysFallback()
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500
+}
+
+async function downloadTenderAttachmentWithRetry(params: {
+  href: string
+  attachmentName: string
+}): Promise<{ ok: true; data: Buffer } | { ok: false; error: string }> {
+  const retries = Math.max(0, Number(process.env.AUTO_MATCH_ATTACHMENT_RETRIES ?? 2))
+  const baseDelayMs = Math.max(100, Number(process.env.AUTO_MATCH_RETRY_BASE_DELAY_MS ?? 1200))
+
+  let lastError = 'attachment download failed'
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const url = `${autoMatchBaseUrl()}/api/tender-attachment?href=${encodeURIComponent(params.href)}&realName=${encodeURIComponent(params.attachmentName || 'attachment')}`
+      const resp = await fetch(url, { signal: AbortSignal.timeout(90000) })
+
+      if (resp.ok) {
+        const data = Buffer.from(await resp.arrayBuffer())
+        return { ok: true, data }
+      }
+
+      const detail = await readHttpErrorMessage(resp)
+      lastError = detail
+        ? `attachment failed: ${resp.status}: ${detail}`
+        : `attachment failed: ${resp.status}`
+      if (attempt < retries && isRetryableStatus(resp.status)) {
+        await sleepMs(baseDelayMs * Math.pow(2, attempt))
+        continue
+      }
+      return { ok: false, error: `${lastError} (attempt ${attempt + 1}/${retries + 1})` }
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e)
+      if (attempt < retries) {
+        await sleepMs(baseDelayMs * Math.pow(2, attempt))
+        continue
+      }
+      return { ok: false, error: `attachment failed: ${lastError} (attempt ${attempt + 1}/${retries + 1})` }
+    }
+  }
+
+  return { ok: false, error: lastError }
+}
+
+async function runMatchForAttachment(params: {
+  data: Buffer
+  filename: string
+  auctionNumber: string | null
+  customerName: string | null
+  customerInn: string | null
+  auctionPrice: number | null
+  sourceUrl: string | null
+  disableLlm?: boolean
+  forceAllLibraryCandidates?: boolean
+  autoMode?: boolean
+}): Promise<{ ok: boolean; json?: any; error?: string }> {
+  const safeFilename = params.filename.replace(/[\r\n"]/g, ' ').replace(/\s+/g, ' ').trim() || 'attachment.bin'
+  const retries = Math.max(0, Number(process.env.AUTO_MATCH_MATCH_RETRIES ?? 0))
+  const baseDelayMs = Math.max(100, Number(process.env.AUTO_MATCH_RETRY_BASE_DELAY_MS ?? 1200))
+  const matchTimeoutMs = Math.max(10000, Number(process.env.AUTO_MATCH_MATCH_TIMEOUT_MS ?? 60000))
+
+  let lastError = 'match failed'
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const form = new FormData()
+    const blob = new Blob([Uint8Array.from(params.data)], { type: 'application/octet-stream' })
+    form.append('file', blob, safeFilename)
+    form.append('clientFilename', safeFilename)
+    if (params.auctionNumber) form.append('auctionNumber', params.auctionNumber)
+    if (params.customerName) form.append('customerName', params.customerName)
+    if (params.customerInn) form.append('customerInn', params.customerInn)
+    if (typeof params.auctionPrice === 'number' && Number.isFinite(params.auctionPrice)) {
+      form.append('auctionPrice', String(params.auctionPrice))
+    }
+    if (params.sourceUrl) form.append('sourceUrl', params.sourceUrl)
+    form.append('sendEmail', 'false')
+    if (params.disableLlm) form.append('disableLlm', 'true')
+    if (params.forceAllLibraryCandidates) form.append('forceAllLibraryCandidates', 'true')
+    if (params.autoMode) form.append('autoMode', 'true')
+
+    try {
+      const resp = await fetch(`${autoMatchBaseUrl()}/api/match`, {
+        method: 'POST',
+        body: form,
+        signal: AbortSignal.timeout(matchTimeoutMs),
+      })
+      const json: any = await resp.json().catch(() => null)
+      if (resp.ok) return { ok: true, json }
+
+      lastError = json?.error ?? `match failed: ${resp.status}`
+      if (attempt < retries && isRetryableStatus(resp.status)) {
+        await sleepMs(baseDelayMs * Math.pow(2, attempt))
+        continue
+      }
+      return { ok: false, error: `${lastError} (attempt ${attempt + 1}/${retries + 1})` }
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e)
+      if (attempt < retries) {
+        await sleepMs(baseDelayMs * Math.pow(2, attempt))
+        continue
+      }
+      return { ok: false, error: `${lastError} (attempt ${attempt + 1}/${retries + 1})` }
+    }
+  }
+
+  return { ok: false, error: lastError }
+}
+
+async function runAutoMatchCycle(trigger: 'interval' | 'manual'): Promise<void> {
+  if (autoMatchRunInProgress) return
+  autoMatchRunInProgress = true
+  autoMatchState.running = true
+  autoMatchState.currentRunStartedAt = new Date().toISOString()
+  autoMatchState.lastRunAt = autoMatchState.currentRunStartedAt
+  // Per-run counters: reset at the beginning of every new cycle.
+  autoMatchState.stats = {
+    processed: 0,
+    matched: 0,
+    noMatch: 0,
+    skipped: 0,
+    errors: 0,
+  }
+  autoMatchState.currentItem = {
+    stage: 'keys',
+    updatedAt: new Date().toISOString(),
+  }
+  await saveAutoMatchState().catch(() => undefined)
+
+  const maxKeys = parsePositiveLimit(process.env.AUTO_MATCH_MAX_KEYS, Number.POSITIVE_INFINITY)
+  const maxTendersPerKey = parsePositiveLimit(process.env.AUTO_MATCH_MAX_TENDERS_PER_KEY, Number.POSITIVE_INFINITY)
+  const maxAttachmentsPerTender = parsePositiveLimit(
+    process.env.AUTO_MATCH_MAX_ATTACHMENTS_PER_TENDER,
+    Number.POSITIVE_INFINITY,
+  )
+  const forceAllLibraryCandidates = String(process.env.AUTO_MATCH_FORCE_ALL_LIBRARY_CANDIDATES ?? 'false') === 'true'
+  const historyErrorDedup = new Set<string>()
+
+  try {
+    const keyList = await fetchAutoMatchAllKeys()
+    const keys = Number.isFinite(maxKeys) ? keyList.slice(0, maxKeys) : keyList
+    for (const key of keys) {
+      const keyId = String(key._id ?? '').trim()
+      if (!keyId) continue
+      autoMatchState.currentItem = {
+        stage: 'tenders',
+        keyId,
+        updatedAt: new Date().toISOString(),
+      }
+
+      let tenders: Array<{ _id: string; orderName: string }> = []
+      try {
+        const tendersResp = await fetch(`${autoMatchBaseUrl()}/api/tender-tenders?key=${encodeURIComponent(keyId)}`, {
+          signal: AbortSignal.timeout(30000),
+        })
+        const tendersJson: any = await tendersResp.json().catch(() => null)
+        if (!tendersResp.ok) {
+          const detail = await readHttpErrorMessage(tendersResp)
+          const message = detail
+            ? `tenders failed: ${tendersResp.status}: ${detail}`
+            : (tendersJson?.error ?? `tenders failed: ${tendersResp.status}`)
+          const dedupKey = `tenders|${keyId}|${message}`
+          if (!historyErrorDedup.has(dedupKey)) {
+            historyErrorDedup.add(dedupKey)
+            autoMatchPushHistory({
+              timestamp: new Date().toISOString(),
+              keyId,
+              tenderId: '',
+              attachmentName: '',
+              status: 'error',
+              message,
+            })
+          }
+          autoMatchState.stats.errors++
+          continue
+        }
+        const raw = Array.isArray(tendersJson?.tenders) ? tendersJson.tenders : []
+        const normalized = raw
+          .filter((x: any) => typeof x?._id === 'string')
+          .map((x: any) => ({ _id: String(x._id), orderName: String(x?.orderName ?? '') }))
+        tenders = Number.isFinite(maxTendersPerKey) ? normalized.slice(0, maxTendersPerKey) : normalized
+      } catch (e) {
+        autoMatchPushHistory({
+          timestamp: new Date().toISOString(),
+          keyId,
+          tenderId: '',
+          attachmentName: '',
+          status: 'error',
+          message: e instanceof Error ? e.message : String(e),
+        })
+        autoMatchState.stats.errors++
+        continue
+      }
+
+      for (const tender of tenders) {
+        autoMatchState.currentItem = {
+          stage: 'tender_details',
+          keyId,
+          tenderId: tender._id,
+          updatedAt: new Date().toISOString(),
+        }
+        let details: any = null
+        try {
+          const dResp = await fetch(`${autoMatchBaseUrl()}/api/tenders/get?id=${encodeURIComponent(tender._id)}`, {
+            signal: AbortSignal.timeout(30000),
+          })
+          const dJson: any = await dResp.json().catch(() => null)
+          if (!dResp.ok) {
+            const detail = await readHttpErrorMessage(dResp)
+            const message = detail
+              ? `tender details failed: ${dResp.status}: ${detail}`
+              : (dJson?.error ?? `tender details failed: ${dResp.status}`)
+            const dedupKey = `details|${keyId}|${tender._id}|${message}`
+            if (!historyErrorDedup.has(dedupKey)) {
+              historyErrorDedup.add(dedupKey)
+              autoMatchPushHistory({
+                timestamp: new Date().toISOString(),
+                keyId,
+                tenderId: tender._id,
+                attachmentName: '',
+                status: 'error',
+                message,
+              })
+            }
+            autoMatchState.stats.errors++
+            continue
+          }
+          details = dJson
+        } catch (e) {
+          autoMatchPushHistory({
+            timestamp: new Date().toISOString(),
+            keyId,
+            tenderId: tender._id,
+            attachmentName: '',
+            status: 'error',
+            message: e instanceof Error ? e.message : String(e),
+          })
+          autoMatchState.stats.errors++
+          continue
+        }
+
+        const allAttachments = Array.isArray(details?.attachments) ? details.attachments : []
+        const attachments = Number.isFinite(maxAttachmentsPerTender)
+          ? allAttachments.slice(0, maxAttachmentsPerTender)
+          : allAttachments
+        for (const a of attachments) {
+          const attachmentName = String(a?.realName ?? '')
+          const href = String(a?.href ?? '')
+          if (!href) continue
+          autoMatchState.currentItem = {
+            stage: 'attachment_download',
+            keyId,
+            tenderId: tender._id,
+            attachmentName,
+            updatedAt: new Date().toISOString(),
+          }
+          autoMatchState.stats.processed++
+
+          try {
+            const dlResult = await downloadTenderAttachmentWithRetry({
+              href,
+              attachmentName: attachmentName || 'attachment',
+            })
+            if (!dlResult.ok) {
+              const message = dlResult.error
+              const dedupKey = `attachment|${keyId}|${tender._id}|${href}|${message}`
+              autoMatchState.stats.errors++
+              if (!historyErrorDedup.has(dedupKey)) {
+                historyErrorDedup.add(dedupKey)
+                autoMatchPushHistory({
+                  timestamp: new Date().toISOString(),
+                  keyId,
+                  tenderId: tender._id,
+                  attachmentName,
+                  status: 'error',
+                  message,
+                })
+              }
+              continue
+            }
+
+            const match = await runMatchForAttachment({
+              data: dlResult.data,
+              filename: attachmentName || 'attachment',
+              auctionNumber: asNonEmptyString(details?.auctionNumber),
+              customerName: asNonEmptyString(details?.customerName),
+              customerInn: asNonEmptyString(details?.customerInn),
+              auctionPrice: asNullableNumber(details?.maxPrice),
+              sourceUrl: asNonEmptyString(details?.href),
+              disableLlm: true,
+              forceAllLibraryCandidates,
+              autoMode: true,
+            })
+            autoMatchState.currentItem = {
+              stage: 'matching',
+              keyId,
+              tenderId: tender._id,
+              attachmentName,
+              updatedAt: new Date().toISOString(),
+            }
+
+            if (!match.ok) {
+              const message = String(match.error ?? 'match failed')
+              const dedupKey = `match|${keyId}|${tender._id}|${attachmentName}|${message}`
+              autoMatchState.stats.errors++
+              if (!historyErrorDedup.has(dedupKey)) {
+                historyErrorDedup.add(dedupKey)
+                autoMatchPushHistory({
+                  timestamp: new Date().toISOString(),
+                  keyId,
+                  tenderId: tender._id,
+                  attachmentName,
+                  status: 'error',
+                  message,
+                })
+              }
+              continue
+            }
+
+            const decision = String(match.json?.decision ?? '')
+            const crmNotification = match.json?.crmNotification
+            if (decision === 'match') {
+              const crmSent = Boolean(crmNotification?.sent)
+              if (crmSent) {
+                autoMatchState.stats.matched++
+                autoMatchPushHistory({
+                  timestamp: new Date().toISOString(),
+                  keyId,
+                  tenderId: tender._id,
+                  attachmentName,
+                  status: 'matched',
+                  matchPercent: Number(match.json?.matchPercent ?? 0),
+                  bestMatchFilename: typeof match.json?.bestMatchFilename === 'string' ? match.json.bestMatchFilename : null,
+                })
+              } else {
+                autoMatchState.stats.skipped++
+                autoMatchPushHistory({
+                  timestamp: new Date().toISOString(),
+                  keyId,
+                  tenderId: tender._id,
+                  attachmentName,
+                  status: 'skipped',
+                  message: typeof crmNotification?.reason === 'string' ? crmNotification.reason : 'Skipped',
+                  matchPercent: Number(match.json?.matchPercent ?? 0),
+                  bestMatchFilename: typeof match.json?.bestMatchFilename === 'string' ? match.json.bestMatchFilename : null,
+                })
+              }
+            } else {
+              autoMatchState.stats.noMatch++
+              autoMatchPushHistory({
+                timestamp: new Date().toISOString(),
+                keyId,
+                tenderId: tender._id,
+                attachmentName,
+                status: 'no_match',
+                matchPercent: Number(match.json?.matchPercent ?? 0),
+                bestMatchFilename: typeof match.json?.bestMatchFilename === 'string' ? match.json.bestMatchFilename : null,
+              })
+            }
+          } catch (e) {
+            const message = e instanceof Error ? e.message : String(e)
+            const dedupKey = `runtime|${keyId}|${tender._id}|${attachmentName}|${message}`
+            autoMatchState.stats.errors++
+            if (!historyErrorDedup.has(dedupKey)) {
+              historyErrorDedup.add(dedupKey)
+              autoMatchPushHistory({
+                timestamp: new Date().toISOString(),
+                keyId,
+                tenderId: tender._id,
+                attachmentName,
+                status: 'error',
+                message,
+              })
+            }
+          }
+        }
+      }
+    }
+  } finally {
+    autoMatchState.running = false
+    autoMatchState.currentRunStartedAt = null
+    autoMatchState.lastRunFinishedAt = new Date().toISOString()
+    autoMatchState.currentItem = null
+    autoMatchRunInProgress = false
+    await saveAutoMatchState().catch(() => undefined)
+    // Trigger field is kept to make debugging easier in future extension.
+    void trigger
+  }
+}
+
+app.get('/api/auto-match/status', async (_req, res) => {
+  res.json({ ok: true, ...autoMatchState })
+})
+
+app.post('/api/auto-match/start', express.json(), async (req, res) => {
+  const interval = String(req.body?.interval ?? autoMatchState.interval) as AutoMatchIntervalCode
+  if (!Object.prototype.hasOwnProperty.call(AUTO_MATCH_INTERVALS_MS, interval)) {
+    return res.status(400).json({ error: 'Invalid interval. Allowed: 3m,5m,10m,30m,60m' })
+  }
+  autoMatchState.enabled = true
+  autoMatchState.interval = interval
+  startAutoMatchScheduler()
+  await saveAutoMatchState().catch(() => undefined)
+  res.json({ ok: true, ...autoMatchState })
+})
+
+app.post('/api/auto-match/stop', async (_req, res) => {
+  autoMatchState.enabled = false
+  stopAutoMatchScheduler()
+  await saveAutoMatchState().catch(() => undefined)
+  res.json({ ok: true, ...autoMatchState })
+})
+
+app.post('/api/auto-match/run-once', async (_req, res) => {
+  if (autoMatchRunInProgress) {
+    return res.json({ ok: true, started: false, alreadyRunning: true })
+  }
+  void runAutoMatchCycle('manual')
+  res.json({ ok: true, started: true, alreadyRunning: false })
+})
+
 const port = Number(process.env.PORT ?? 3001)
 
 app.listen(port, () => {
   // eslint-disable-next-line no-console
   console.log(`Backend listening on http://localhost:${port}`)
+  void (async () => {
+    await loadAutoMatchState()
+    if (autoMatchState.enabled) {
+      startAutoMatchScheduler()
+    }
+  })()
 })
 
