@@ -638,6 +638,8 @@ export default function App() {
 
   async function moveLibraryDoc(docId: string, folderId: string | null) {
     setLibraryError('')
+    // Optimistic UI: immediately move file in local state.
+    setLibrary((prev) => prev.map((doc) => (doc.id === docId ? { ...doc, folderId } : doc)))
     try {
       const resp = await fetch('/api/library/move', {
         method: 'POST',
@@ -646,12 +648,35 @@ export default function App() {
       })
       const json = await resp.json().catch(() => null)
       if (!resp.ok) throw new Error(json?.error ?? `Failed: ${resp.status}`)
+      const moved = json?.doc as LibraryDoc | undefined
+      if (moved && moved.id) {
+        setLibrary((prev) =>
+          prev.map((doc) =>
+            doc.id === moved.id
+              ? {
+                  ...doc,
+                  folderId: moved.folderId ?? null,
+                }
+              : doc,
+          ),
+        )
+      }
       await refreshLibrary()
     } catch (e) {
+      // Roll back optimistic move by reloading canonical state.
+      await refreshLibrary().catch(() => undefined)
       setLibraryError(e instanceof Error ? e.message : String(e))
     } finally {
       setMovingLibraryDocId(null)
     }
+  }
+
+  function readDraggedLibraryDocId(event: React.DragEvent): string {
+    const custom = event.dataTransfer.getData('text/library-doc-id')
+    if (custom && custom.trim().length > 0) return custom.trim()
+    const plain = event.dataTransfer.getData('text/plain')
+    if (plain && plain.startsWith('library-doc-id:')) return plain.slice('library-doc-id:'.length).trim()
+    return ''
   }
 
   async function fetchAutoMatchStatus() {
@@ -1928,7 +1953,8 @@ export default function App() {
                 }}
                 onDrop={(e) => {
                   e.preventDefault()
-                  const docId = e.dataTransfer.getData('text/library-doc-id')
+                  e.stopPropagation()
+                  const docId = readDraggedLibraryDocId(e)
                   if (docId) void moveLibraryDoc(docId, null)
                 }}
               >
@@ -1947,7 +1973,8 @@ export default function App() {
                     }}
                     onDrop={(e) => {
                       e.preventDefault()
-                      const docId = e.dataTransfer.getData('text/library-doc-id')
+                      e.stopPropagation()
+                      const docId = readDraggedLibraryDocId(e)
                       if (docId) void moveLibraryDoc(docId, folder.id)
                     }}
                     role="button"
@@ -1976,6 +2003,8 @@ export default function App() {
                     draggable
                     onDragStart={(e) => {
                       e.dataTransfer.setData('text/library-doc-id', d.id)
+                      e.dataTransfer.setData('text/plain', `library-doc-id:${d.id}`)
+                      e.dataTransfer.effectAllowed = 'move'
                       setMovingLibraryDocId(d.id)
                     }}
                     onDragEnd={() => setMovingLibraryDocId(null)}
