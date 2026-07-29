@@ -31,6 +31,11 @@ type LibraryFolder = {
   createdAt: string
 }
 
+type FolderDropFeedback = {
+  text: string
+  kind: 'status' | 'error'
+}
+
 type MatchResult = {
   id: string
   originalFilename: string
@@ -381,7 +386,13 @@ async function uploadFile(endpoint: string, file: File, extraFields?: Record<str
 
   const json = await resp.json().catch(() => null)
   if (!resp.ok) {
-    throw new Error(json?.error ?? `Request failed with status ${resp.status}`)
+    const error = new Error(json?.error ?? `Request failed with status ${resp.status}`) as Error & {
+      status?: number
+      payload?: any
+    }
+    error.status = resp.status
+    error.payload = json
+    throw error
   }
   return json
 }
@@ -464,6 +475,8 @@ export default function App() {
   const [currentLibraryFolderId, setCurrentLibraryFolderId] = useState<string | null>(null)
   const [newLibraryFolderName, setNewLibraryFolderName] = useState('')
   const [movingLibraryDocId, setMovingLibraryDocId] = useState<string | null>(null)
+  const [folderDropFeedback, setFolderDropFeedback] = useState<Record<string, FolderDropFeedback>>({})
+  const folderFeedbackTimersRef = useRef<Map<string, number>>(new Map())
   const [librarySearchQuery, setLibrarySearchQuery] = useState('')
   const [libraryStatus, setLibraryStatus] = useState<string>('')
   const [libraryError, setLibraryError] = useState<string>('')
@@ -520,6 +533,9 @@ export default function App() {
   const libraryOperationInProgressRef = useRef(false)
   const tenderLoadCacheRef = useRef<Map<string, TenderLoadCacheEntry>>(new Map())
   const zipArchivesRef = useRef<Map<string, JSZip>>(new Map())
+  const draggedLibraryDocIdRef = useRef<string | null>(null)
+  const libraryRefreshSeqRef = useRef(0)
+  const libraryFolderOverrideRef = useRef<Map<string, string | null>>(new Map())
   const [tenderModalStep, setTenderModalStep] = useState<'tenders' | 'attachments'>('tenders')
   const [autoMatchStatus, setAutoMatchStatus] = useState<AutoMatchStatus | null>(null)
   const [autoMatchIntervalDraft, setAutoMatchIntervalDraft] = useState<AutoMatchIntervalCode>('10m')
@@ -547,14 +563,21 @@ export default function App() {
   const autoMatchErrorLogs = autoMatchHistoryForLogs.filter((item) => item.status === 'error')
   const autoMatchSkippedLogs = autoMatchHistoryForLogs.filter((item) => item.status === 'skipped')
   const normalizedLibrarySearchQuery = librarySearchQuery.trim().toLowerCase()
+  const effectiveLibraryDocs = library.map((doc) => {
+    const overrideFolderId = libraryFolderOverrideRef.current.has(doc.id)
+      ? (libraryFolderOverrideRef.current.get(doc.id) ?? null)
+      : undefined
+    if (overrideFolderId === undefined) return doc
+    return { ...doc, folderId: overrideFolderId }
+  })
   const currentLibraryFolder =
     currentLibraryFolderId == null
       ? null
       : libraryFolders.find((f) => f.id === currentLibraryFolderId) ?? null
   const visibleLibraryDocs =
     currentLibraryFolderId == null
-      ? library.filter((d) => !d.folderId)
-      : library.filter((d) => d.folderId === currentLibraryFolderId)
+      ? effectiveLibraryDocs.filter((d) => !d.folderId)
+      : effectiveLibraryDocs.filter((d) => d.folderId === currentLibraryFolderId)
   const visibleLibraryFolders = currentLibraryFolderId == null ? libraryFolders : []
   const filteredLibrary =
     normalizedLibrarySearchQuery.length === 0
@@ -600,13 +623,30 @@ export default function App() {
   }
 
   async function refreshLibrary(): Promise<LibraryDoc[]> {
-    const resp = await fetch('/api/library/list')
+    const requestSeq = ++libraryRefreshSeqRef.current
+    const resp = await fetch(`/api/library/list?_=${Date.now()}`, { cache: 'no-store' })
     const json = await resp.json()
     if (!resp.ok) throw new Error(json?.error ?? 'Failed to load library')
     const docs: LibraryDoc[] = json.docs ?? []
     const folders: LibraryFolder[] = Array.isArray(json.folders) ? json.folders : []
+    if (requestSeq !== libraryRefreshSeqRef.current) {
+      // Ignore stale responses to prevent UI rollback after DnD move.
+      return docs
+    }
+    const overrides = libraryFolderOverrideRef.current
+    const patchedDocs = docs.map((doc) => {
+      if (!overrides.has(doc.id)) return doc
+      const targetFolderId = overrides.get(doc.id) ?? null
+      const serverFolderId = doc.folderId ?? null
+      if (serverFolderId === targetFolderId) {
+        overrides.delete(doc.id)
+        return doc
+      }
+      return { ...doc, folderId: targetFolderId }
+    })
+
     setLibraryFolders(folders)
-    setLibrary(docs)
+    setLibrary(patchedDocs)
     setCurrentLibraryFolderId((prev) => {
       if (!prev) return prev
       return folders.some((f) => f.id === prev) ? prev : null
@@ -636,8 +676,28 @@ export default function App() {
     }
   }
 
-  async function moveLibraryDoc(docId: string, folderId: string | null) {
+  function setFolderFeedback(key: string, text: string, kind: 'status' | 'error') {
+    const prevTimer = folderFeedbackTimersRef.current.get(key)
+    if (prevTimer) window.clearTimeout(prevTimer)
+    setFolderDropFeedback((prev) => ({ ...prev, [key]: { text, kind } }))
+    const ttlMs = kind === 'error' ? 6000 : 3500
+    const timer = window.setTimeout(() => {
+      setFolderDropFeedback((prev) => {
+        const next = { ...prev }
+        delete next[key]
+        return next
+      })
+      folderFeedbackTimersRef.current.delete(key)
+    }, ttlMs)
+    folderFeedbackTimersRef.current.set(key, timer)
+  }
+
+  async function moveLibraryDoc(docId: string, folderId: string | null, feedbackKey?: string) {
     setLibraryError('')
+    if (feedbackKey) setFolderFeedback(feedbackKey, 'Перемещаю файл...', 'status')
+    // Invalidate in-flight refreshes so stale list can't re-add file visually.
+    libraryRefreshSeqRef.current += 1
+    libraryFolderOverrideRef.current.set(docId, folderId)
     // Optimistic UI: immediately move file in local state.
     setLibrary((prev) => prev.map((doc) => (doc.id === docId ? { ...doc, folderId } : doc)))
     try {
@@ -661,11 +721,15 @@ export default function App() {
           ),
         )
       }
-      await refreshLibrary()
+      // Background reconciliation; override guard prevents visual rollback.
+      void refreshLibrary().catch(() => undefined)
+      if (feedbackKey) setFolderFeedback(feedbackKey, 'Файл перенесен', 'status')
     } catch (e) {
       // Roll back optimistic move by reloading canonical state.
+      libraryFolderOverrideRef.current.delete(docId)
       await refreshLibrary().catch(() => undefined)
       setLibraryError(e instanceof Error ? e.message : String(e))
+      if (feedbackKey) setFolderFeedback(feedbackKey, e instanceof Error ? e.message : String(e), 'error')
     } finally {
       setMovingLibraryDocId(null)
     }
@@ -676,7 +740,33 @@ export default function App() {
     if (custom && custom.trim().length > 0) return custom.trim()
     const plain = event.dataTransfer.getData('text/plain')
     if (plain && plain.startsWith('library-doc-id:')) return plain.slice('library-doc-id:'.length).trim()
+    if (draggedLibraryDocIdRef.current && draggedLibraryDocIdRef.current.trim().length > 0) {
+      return draggedLibraryDocIdRef.current.trim()
+    }
     return ''
+  }
+
+  async function collectDroppedLibraryFiles(
+    event: React.DragEvent,
+  ): Promise<Array<File & { webkitRelativePath?: string }>> {
+    let files: Array<File & { webkitRelativePath?: string }> = []
+    const items = Array.from(event.dataTransfer.items ?? [])
+    if (items.length > 0) {
+      const collected = await Promise.all(
+        items.map(async (item) => {
+          const asAny = item as any
+          const entry = typeof asAny.webkitGetAsEntry === 'function' ? asAny.webkitGetAsEntry() : null
+          if (entry) return await collectFilesFromDropEntry(entry)
+          const f = item.getAsFile()
+          return f ? [f as File & { webkitRelativePath?: string }] : []
+        }),
+      )
+      files = collected.flat()
+    }
+    if (files.length === 0) {
+      files = Array.from(event.dataTransfer.files ?? []) as Array<File & { webkitRelativePath?: string }>
+    }
+    return files
   }
 
   async function fetchAutoMatchStatus() {
@@ -844,27 +934,20 @@ export default function App() {
     setSelectedTenderMeta(null)
   }, [selectedTenderKeyIds])
 
+  useEffect(() => {
+    return () => {
+      for (const timer of folderFeedbackTimersRef.current.values()) {
+        window.clearTimeout(timer)
+      }
+      folderFeedbackTimersRef.current.clear()
+    }
+  }, [])
+
   async function onDropLibraryFiles(event: React.DragEvent<HTMLDivElement>) {
     event.preventDefault()
     event.stopPropagation()
     if (libraryOperationInProgressRef.current) return
-    let files: Array<File & { webkitRelativePath?: string }> = []
-    const items = Array.from(event.dataTransfer.items ?? [])
-    if (items.length > 0) {
-      const collected = await Promise.all(
-        items.map(async (item) => {
-          const asAny = item as any
-          const entry = typeof asAny.webkitGetAsEntry === 'function' ? asAny.webkitGetAsEntry() : null
-          if (entry) return await collectFilesFromDropEntry(entry)
-          const f = item.getAsFile()
-          return f ? [f as File & { webkitRelativePath?: string }] : []
-        }),
-      )
-      files = collected.flat()
-    }
-    if (files.length === 0) {
-      files = Array.from(event.dataTransfer.files ?? []) as Array<File & { webkitRelativePath?: string }>
-    }
+    const files = await collectDroppedLibraryFiles(event)
     if (files.length === 0) return
     await onAddToLibrary(files)
   }
@@ -1241,8 +1324,13 @@ export default function App() {
     }
   }
 
-  async function onAddToLibrary(filesInput: FileList | File[] | null) {
+  async function onAddToLibrary(
+    filesInput: FileList | File[] | null,
+    targetFolderId: string | null = null,
+    feedbackKey?: string,
+  ) {
     setLibraryError('')
+    if (feedbackKey) setFolderFeedback(feedbackKey, 'Добавляю файлы...', 'status')
     const incoming = filesInput ? Array.from(filesInput) : []
     const files: File[] = []
     for (const f of incoming) {
@@ -1254,7 +1342,9 @@ export default function App() {
     }
     if (files.length === 0) {
       if (incoming.length > 0) {
-        setLibraryError('Не найдено поддерживаемых файлов для индексации (pdf/doc/docx/xls/xlsx).')
+        const msg = 'Не найдено поддерживаемых файлов для индексации (pdf/doc/docx/xls/xlsx).'
+        setLibraryError(msg)
+        if (feedbackKey) setFolderFeedback(feedbackKey, msg, 'error')
       }
       return
     }
@@ -1264,8 +1354,10 @@ export default function App() {
       await refreshLibrary().catch(() => undefined)
       let added = 0
       let skippedDuplicates = 0
+      let replacedDuplicates = 0
       let skippedInvalidOffice = 0
       const failed: string[] = []
+      const duplicateCandidates: Array<{ file: File; displayName: string }> = []
       let nextIndex = 0
       let finished = 0
       const total = files.length
@@ -1294,7 +1386,18 @@ export default function App() {
             const maxAttempts = 2
             for (let attempt = 1; attempt <= maxAttempts; attempt++) {
               try {
-                await uploadFile('/api/library/add', file)
+                const uploadedDoc = await uploadFile('/api/library/add', file)
+                if (targetFolderId && typeof uploadedDoc?.id === 'string') {
+                  const moveResp = await fetch('/api/library/move', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ docId: uploadedDoc.id, folderId: targetFolderId }),
+                  })
+                  const moveJson = await moveResp.json().catch(() => null)
+                  if (!moveResp.ok) {
+                    throw new Error(moveJson?.error ?? `Move failed: ${moveResp.status}`)
+                  }
+                }
                 uploaded = true
                 break
               } catch (e) {
@@ -1311,6 +1414,13 @@ export default function App() {
             added++
           } catch (e) {
             const message = e instanceof Error ? e.message : String(e)
+            const maybeStatus = (e as any)?.status
+            const maybePayload = (e as any)?.payload
+            if (maybeStatus === 409 && maybePayload?.duplicate) {
+              skippedDuplicates++
+              duplicateCandidates.push({ file, displayName })
+              continue
+            }
             const isDuplicate =
               message.toLowerCase().includes('уже есть в библиотеке') ||
               message.toLowerCase().includes('already exists') ||
@@ -1329,6 +1439,28 @@ export default function App() {
 
       await Promise.all(Array.from({ length: workersCount }, () => runWorker()))
 
+      if (duplicateCandidates.length > 0) {
+        const askReplace = window.confirm(
+          duplicateCandidates.length === 1
+            ? `Обнаружен дубликат файла "${duplicateCandidates[0].displayName}". Заменить его в библиотеке?`
+            : `Обнаружены дубликаты (${duplicateCandidates.length} шт.). Заменить их в библиотеке?`,
+        )
+        if (askReplace) {
+          for (const item of duplicateCandidates) {
+            try {
+              const extra: Record<string, string> = { replaceExisting: 'true' }
+              if (targetFolderId) extra.folderId = targetFolderId
+              await uploadFile('/api/library/add', item.file, extra)
+              replacedDuplicates++
+              skippedDuplicates = Math.max(0, skippedDuplicates - 1)
+            } catch (e) {
+              const message = e instanceof Error ? e.message : String(e)
+              failed.push(`${item.displayName}: ${message}`)
+            }
+          }
+        }
+      }
+
       setLibraryStatus('Готово. Обновляю список библиотеки...')
       await refreshLibrary()
       // Avoid confusion when newly added files are hidden by stale search filter.
@@ -1336,16 +1468,20 @@ export default function App() {
         setLibrarySearchQuery('')
       }
       const summaryParts = [`Добавлено: ${added}`]
+      if (replacedDuplicates > 0) summaryParts.push(`заменено: ${replacedDuplicates}`)
       if (skippedDuplicates > 0) summaryParts.push(`пропущено дубликатов: ${skippedDuplicates}`)
       if (skippedInvalidOffice > 0) summaryParts.push(`пропущено поврежденных office: ${skippedInvalidOffice}`)
       if (failed.length > 0) summaryParts.push(`ошибок: ${failed.length}`)
-      setLibraryStatus(summaryParts.join(' • '))
+      const summary = summaryParts.join(' • ')
+      setLibraryStatus(summary)
+      if (feedbackKey) setFolderFeedback(feedbackKey, summary, failed.length > 0 ? 'error' : 'status')
       if (failed.length > 0) {
         setLibraryError(failed.slice(0, 2).join(' | ') + (failed.length > 2 ? ` (+${failed.length - 2} еще)` : ''))
       }
     } catch (e) {
       setLibraryStatus('')
       setLibraryError(e instanceof Error ? e.message : String(e))
+      if (feedbackKey) setFolderFeedback(feedbackKey, e instanceof Error ? e.message : String(e), 'error')
     } finally {
       libraryOperationInProgressRef.current = false
       if (libraryFileInputRef.current) libraryFileInputRef.current.value = ''
@@ -1951,15 +2087,31 @@ export default function App() {
                 onDragOver={(e) => {
                   e.preventDefault()
                 }}
-                onDrop={(e) => {
+                onDrop={async (e) => {
                   e.preventDefault()
                   e.stopPropagation()
                   const docId = readDraggedLibraryDocId(e)
-                  if (docId) void moveLibraryDoc(docId, null)
+                  if (docId) {
+                    void moveLibraryDoc(docId, null, currentLibraryFolderId ?? undefined)
+                    return
+                  }
+                  const files = await collectDroppedLibraryFiles(e)
+                  if (files.length > 0) {
+                    void onAddToLibrary(files, currentLibraryFolderId, currentLibraryFolderId ?? undefined)
+                  }
                 }}
               >
-                Перетащите сюда файл, чтобы вернуть в корень
+                Перетащите сюда файл из папки, чтобы вернуть в корень, или файлы/папку с компьютера, чтобы добавить в текущую папку
               </div>
+            ) : null}
+            {currentLibraryFolderId && folderDropFeedback[currentLibraryFolderId] ? (
+              <p
+                className={
+                  folderDropFeedback[currentLibraryFolderId].kind === 'error' ? 'ms-error ms-inline-feedback' : 'ms-status ms-inline-feedback'
+                }
+              >
+                {folderDropFeedback[currentLibraryFolderId].text}
+              </p>
             ) : null}
             {visibleLibraryFolders.length > 0 ? (
               <div className="ms-grid ms-grid--library">
@@ -1971,11 +2123,18 @@ export default function App() {
                     onDragOver={(e) => {
                       e.preventDefault()
                     }}
-                    onDrop={(e) => {
+                    onDrop={async (e) => {
                       e.preventDefault()
                       e.stopPropagation()
                       const docId = readDraggedLibraryDocId(e)
-                      if (docId) void moveLibraryDoc(docId, folder.id)
+                      if (docId) {
+                        void moveLibraryDoc(docId, folder.id, folder.id)
+                        return
+                      }
+                      const files = await collectDroppedLibraryFiles(e)
+                      if (files.length > 0) {
+                        void onAddToLibrary(files, folder.id, folder.id)
+                      }
                     }}
                     role="button"
                     tabIndex={0}
@@ -1988,6 +2147,11 @@ export default function App() {
                   >
                     <div className="ms-card-title">📁 {folder.name}</div>
                     <div className="ms-meta">{new Date(folder.createdAt).toLocaleString()}</div>
+                    {folderDropFeedback[folder.id] ? (
+                      <div className={`ms-folder-feedback ${folderDropFeedback[folder.id].kind === 'error' ? 'ms-folder-feedback--error' : ''}`}>
+                        {folderDropFeedback[folder.id].text}
+                      </div>
+                    ) : null}
                   </div>
                 ))}
               </div>
@@ -2002,12 +2166,16 @@ export default function App() {
                     className="ms-card ms-card--lib"
                     draggable
                     onDragStart={(e) => {
+                      draggedLibraryDocIdRef.current = d.id
                       e.dataTransfer.setData('text/library-doc-id', d.id)
                       e.dataTransfer.setData('text/plain', `library-doc-id:${d.id}`)
                       e.dataTransfer.effectAllowed = 'move'
                       setMovingLibraryDocId(d.id)
                     }}
-                    onDragEnd={() => setMovingLibraryDocId(null)}
+                    onDragEnd={() => {
+                      setMovingLibraryDocId(null)
+                      draggedLibraryDocIdRef.current = null
+                    }}
                   >
                     <div className="ms-card-actions">
                       <button

@@ -20,7 +20,6 @@ import { valuesMatch } from './lib/valueCompare.js'
 import { compareProductNamesWithOllama, judgeMatch, type RowForJudge, type JudgeDecision } from './lib/judge.js'
 import {
   compositionLongTextFallbackMatch,
-  indicatorsLookKeywordSimilar,
   isExcludedFromParameterMatch,
   scoreKeyValueIndicators,
   tenderAliasesAllowValueCompare,
@@ -2826,6 +2825,9 @@ app.post('/api/library/add', upload.single('file'), async (req, res) => {
     if (!f) return res.status(400).json({ error: 'Missing file (field "file")' })
 
     const clientFilename = typeof req.body?.clientFilename === 'string' ? req.body.clientFilename : null
+    const folderIdRaw = typeof req.body?.folderId === 'string' ? req.body.folderId.trim() : ''
+    const folderId = folderIdRaw.length > 0 ? folderIdRaw : null
+    const replaceExisting = parseBooleanField(req.body?.replaceExisting, false)
     const originalFilename = clientFilename ?? f.originalname
     const fixedFilename = restoreUtf8FromLatin1(originalFilename)
     const extension = safeExtension(fixedFilename)
@@ -2853,11 +2855,49 @@ app.post('/api/library/add', upload.single('file'), async (req, res) => {
 
     const committed = await withLibraryIndexLock(async () => {
       const index = await loadIndex()
+      if (folderId) {
+        const folders = Array.isArray(index.folders) ? index.folders : []
+        const folderExists = folders.some((x) => x.id === folderId)
+        if (!folderExists) throw new Error('Folder not found')
+      }
       const duplicate = await findLibraryDuplicate({
         docs: index.docs,
         buffer: f.buffer,
       })
-      if (duplicate) return { duplicate } as const
+      if (duplicate && !replaceExisting) return { duplicate } as const
+      if (duplicate && replaceExisting) {
+        const existingDoc = index.docs.find((d) => d.id === duplicate.id)
+        if (!existingDoc) return { duplicate } as const
+
+        await fs.mkdir(LIB_DIR, { recursive: true })
+        const nextStoredPath = path.join(LIB_DIR, `${existingDoc.id}-${fixedFilename}`)
+        await fs.writeFile(nextStoredPath, f.buffer)
+        if (existingDoc.storedPath !== nextStoredPath && existingDoc.storedPath.startsWith(LIB_DIR)) {
+          await fs.rm(existingDoc.storedPath, { force: true }).catch(() => undefined)
+        }
+
+        existingDoc.originalFilename = fixedFilename
+        existingDoc.extension = extension
+        existingDoc.storedPath = nextStoredPath
+        existingDoc.folderId = folderId ?? existingDoc.folderId ?? null
+        existingDoc.contentHash = libraryContentHash(f.buffer)
+        existingDoc.normalizedTextHash = normalizedTextHash
+        existingDoc.extractedText = extractedText
+        existingDoc.docEmbedding = docEmbedding
+        existingDoc.embeddingModel =
+          String(process.env.EMBEDDINGS_PROVIDER ?? '').toLowerCase() === 'ollama'
+            ? `ollama:${process.env.OLLAMA_EMBEDDING_MODEL ?? 'nomic-embed-text'}`
+            : String(process.env.EMBEDDINGS_PROVIDER ?? '').toLowerCase() === 'openai'
+              ? `openai:${process.env.OPENAI_EMBEDDING_MODEL ?? 'text-embedding-3-small'}`
+              : `local:${process.env.LOCAL_EMBEDDING_MODEL ?? 'Xenova/all-MiniLM-L6-v2'}`
+        existingDoc.pipelineVersion = 'match-pipeline-v2'
+        existingDoc.rowsCount = rows.length
+        existingDoc.rows = rows
+        existingDoc.indexedAt = new Date().toISOString()
+
+        await saveIndex(index)
+        return { id: existingDoc.id, duplicate: null as null, replaced: true } as const
+      }
 
       await fs.mkdir(LIB_DIR, { recursive: true })
       const id = crypto.randomUUID()
@@ -2869,7 +2909,7 @@ app.post('/api/library/add', upload.single('file'), async (req, res) => {
         originalFilename: fixedFilename,
         extension,
         storedPath,
-        folderId: null,
+        folderId,
         contentHash: libraryContentHash(f.buffer),
         normalizedTextHash,
         extractedText,
@@ -2888,7 +2928,7 @@ app.post('/api/library/add', upload.single('file'), async (req, res) => {
 
       index.docs.push(doc)
       await saveIndex(index)
-      return { id, duplicate: null as null } as const
+      return { id, duplicate: null as null, replaced: false } as const
     })
 
     if (committed.duplicate) {
@@ -2905,6 +2945,7 @@ app.post('/api/library/add', upload.single('file'), async (req, res) => {
       id: committed.id,
       originalFilename,
       rows: rows.length,
+      replaced: Boolean((committed as any)?.replaced),
     })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
@@ -3705,7 +3746,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
             }
 
             const aliasPair = tenderAliasesAllowValueCompare(qRow.indicator, lRow.indicator)
-            const keywordSimilar = indicatorsLookKeywordSimilar(qRow.indicator, lRow.indicator)
+            const keywordSimilar = false
             if (s < indicatorSimilarityThreshold && !aliasPair && !keywordSimilar) continue
 
             const m = valuesMatch({
@@ -3751,7 +3792,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
             compositionLongTextFallbackMatch(qRow.valueRaw, chosenLib.valueRaw)
 
           const bestSimForIndicatorOk = chosenLib === bestLibValueMatch ? bestSimValueMatch : bestSimAll
-          const keywordSimilar = chosenLib ? indicatorsLookKeywordSimilar(qRow.indicator, chosenLib.indicator) : false
+          const keywordSimilar = false
           const indicatorOk =
             bestSimForIndicatorOk >= indicatorSimilarityThreshold ||
             (chosenLib != null &&

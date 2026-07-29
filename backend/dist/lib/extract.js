@@ -39,5 +39,102 @@ export async function extractTextFromFile(params) {
         }
         return normalizeText(lines.join('\n\n'));
     }
+    if (lower.endsWith('.txt') || lower.endsWith('.csv') || lower.endsWith('.html') || lower.endsWith('.htm') || lower.endsWith('.json') || lower.endsWith('.xml')) {
+        const raw = buffer.toString('utf8');
+        if (lower.endsWith('.txt')) {
+            return normalizeText(raw);
+        }
+        if (lower.endsWith('.csv')) {
+            try {
+                const rows = raw
+                    .split(/\r?\n/)
+                    .map((line) => line.trim())
+                    .filter((line) => line.length > 0)
+                    .map((line) => {
+                    const parts = [];
+                    let current = '';
+                    let inQuotes = false;
+                    for (let i = 0; i < line.length; i++) {
+                        const ch = line[i];
+                        if (ch === '"') {
+                            if (inQuotes && line[i + 1] === '"') {
+                                current += '"';
+                                i++;
+                            }
+                            else {
+                                inQuotes = !inQuotes;
+                            }
+                        }
+                        else if (ch === ',' && !inQuotes) {
+                            parts.push(current);
+                            current = '';
+                        }
+                        else {
+                            current += ch;
+                        }
+                    }
+                    parts.push(current);
+                    return parts;
+                });
+                const lines = rows.map((r) => r.map((c) => String(c ?? '').trim()).filter(Boolean).join(' | ')).filter(Boolean);
+                return normalizeText(lines.join('\n'));
+            }
+            catch {
+                return normalizeText(raw);
+            }
+        }
+        if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+            const stripped = raw
+                .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                .replace(/<br\s*\/?>/gi, '\n')
+                .replace(/<\/p>/gi, '\n')
+                .replace(/<\/h[1-6]>/gi, '\n')
+                .replace(/<li[^>]*>/gi, '\n- ')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/&nbsp;/gi, ' ')
+                .replace(/&amp;/gi, '&')
+                .replace(/&quot;/gi, '"')
+                .replace(/&#39;/gi, "'");
+            return normalizeText(stripped);
+        }
+        if (lower.endsWith('.json')) {
+            try {
+                const parsed = JSON.parse(raw);
+                const chunks = [];
+                const walk = (value, prefix = '') => {
+                    if (value == null)
+                        return;
+                    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+                        chunks.push(prefix ? `${prefix}: ${String(value)}` : String(value));
+                        return;
+                    }
+                    if (Array.isArray(value)) {
+                        value.forEach((item, idx) => walk(item, `${prefix}[${idx}]`));
+                        return;
+                    }
+                    if (typeof value === 'object') {
+                        for (const [k, v] of Object.entries(value)) {
+                            walk(v, prefix ? `${prefix}.${k}` : k);
+                        }
+                    }
+                };
+                walk(parsed);
+                return normalizeText(chunks.join('\n'));
+            }
+            catch {
+                return normalizeText(raw);
+            }
+        }
+        if (lower.endsWith('.xml')) {
+            const stripped = raw
+                .replace(/<\?xml[\s\S]*?\?>/gi, ' ')
+                .replace(/<!--[\s\S]*?-->/g, ' ')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/&nbsp;/gi, ' ')
+                .replace(/&amp;/gi, '&');
+            return normalizeText(stripped);
+        }
+    }
     throw new Error(`Unsupported file type: ${filename}`);
 }

@@ -3,8 +3,10 @@ import { PDFParse } from 'pdf-parse';
 import XLSX from 'xlsx';
 import JSZip from 'jszip';
 import WordExtractor from 'word-extractor';
+import { extractTextFromFile } from './extract.js';
 import { normalizeText } from '../utils/text.js';
 import { couldBeProductNameValue, indicatorLooksLikeProductNameColumn, looksLikeAuxValueForFirstColumnProduct, } from './productName.js';
+let tesseractRecognizeCached;
 function cleanCell(v) {
     if (v == null)
         return '';
@@ -679,6 +681,183 @@ async function extractDocxXmlText(buffer) {
     }
     return normalizeText(chunks.join('\n'));
 }
+function parsePositiveIntEnv(name, fallback) {
+    const raw = Number(process.env[name] ?? fallback);
+    if (!Number.isFinite(raw))
+        return fallback;
+    return Math.max(0, Math.floor(raw));
+}
+async function withTimeout(promise, timeoutMs) {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+        return promise;
+    let timer = null;
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs);
+    });
+    try {
+        return await Promise.race([promise, timeoutPromise]);
+    }
+    finally {
+        if (timer)
+            clearTimeout(timer);
+    }
+}
+async function getTesseractRecognize() {
+    if (tesseractRecognizeCached !== undefined)
+        return tesseractRecognizeCached;
+    const tesseractModule = (await import('tesseract.js'));
+    tesseractRecognizeCached =
+        typeof tesseractModule?.recognize === 'function'
+            ? tesseractModule.recognize
+            : typeof tesseractModule?.default?.recognize === 'function'
+                ? tesseractModule.default.recognize
+                : null;
+    return tesseractRecognizeCached;
+}
+function extractVectorImageText(buffer) {
+    const minStrLen = 4;
+    const out = [];
+    const seen = new Set();
+    const isAllowedChar = (code) => {
+        if (code === 9 || code === 10 || code === 13)
+            return true;
+        if (code >= 32 && code <= 126)
+            return true;
+        if (code >= 0x0400 && code <= 0x04ff)
+            return true; // Cyrillic
+        if (code >= 0x00c0 && code <= 0x017f)
+            return true;
+        return false;
+    };
+    for (let i = 0; i + 1 < buffer.length; i += 2) {
+        let j = i;
+        let s = '';
+        while (j + 1 < buffer.length) {
+            const code = buffer.readUInt16LE(j);
+            if (!isAllowedChar(code))
+                break;
+            s += String.fromCharCode(code);
+            j += 2;
+        }
+        if (s.length >= minStrLen) {
+            const normalized = normalizeText(s);
+            const hasLetters = /[a-zа-яё]/i.test(normalized);
+            const isFontName = /(times new roman|arial|calibri)/i.test(normalized);
+            if (hasLetters && !isFontName && !seen.has(normalized)) {
+                out.push(normalized);
+                seen.add(normalized);
+            }
+            i = j;
+        }
+    }
+    return out.join('\n');
+}
+async function extractDocxImageOcrText(buffer) {
+    const maxImages = parsePositiveIntEnv('DOCX_OCR_MAX_IMAGES', 4);
+    if (maxImages === 0)
+        return '';
+    const maxImageBytes = parsePositiveIntEnv('DOCX_OCR_MAX_IMAGE_BYTES', 8 * 1024 * 1024);
+    const minTextLength = parsePositiveIntEnv('DOCX_OCR_MIN_TEXT_LENGTH', 12);
+    const timeoutMs = parsePositiveIntEnv('DOCX_OCR_IMAGE_TIMEOUT_MS', 12000);
+    const lang = String(process.env.DOCX_OCR_LANG ?? 'rus+eng').trim() || 'rus+eng';
+    const zip = await JSZip.loadAsync(buffer);
+    const imageNames = Object.keys(zip.files)
+        .filter((name) => {
+        const lower = name.toLowerCase();
+        if (!lower.startsWith('word/media/'))
+            return false;
+        return /\.(png|jpe?g|bmp|tiff?|webp|emf|wmf)$/i.test(lower);
+    })
+        .slice(0, maxImages);
+    if (imageNames.length === 0)
+        return '';
+    let recognize = null;
+    const chunks = [];
+    for (const name of imageNames) {
+        const f = zip.files[name];
+        if (!f || f.dir)
+            continue;
+        const image = await f.async('nodebuffer');
+        if (image.length === 0 || image.length > maxImageBytes)
+            continue;
+        const lower = name.toLowerCase();
+        const isVectorImage = lower.endsWith('.emf') || lower.endsWith('.wmf');
+        if (isVectorImage) {
+            const vectorText = extractVectorImageText(image);
+            if (vectorText.length >= minTextLength)
+                chunks.push(vectorText);
+            continue;
+        }
+        if (!recognize) {
+            recognize = await getTesseractRecognize();
+            if (!recognize)
+                break;
+        }
+        try {
+            const result = (await withTimeout(recognize(image, lang, {
+                logger: () => undefined,
+            }), timeoutMs));
+            const text = normalizeText(String(result?.data?.text ?? ''));
+            if (text.length >= minTextLength)
+                chunks.push(text);
+        }
+        catch {
+            // Ignore OCR failures for individual images and continue.
+        }
+    }
+    return chunks.join('\n');
+}
+async function extractPdfOcrText(buffer) {
+    const maxPages = parsePositiveIntEnv('PDF_OCR_MAX_PAGES', 3);
+    if (maxPages === 0)
+        return '';
+    const timeoutMs = parsePositiveIntEnv('PDF_OCR_PAGE_TIMEOUT_MS', 20000);
+    const minTextLength = parsePositiveIntEnv('PDF_OCR_MIN_TEXT_LENGTH', 12);
+    const scaleRaw = Number(process.env.PDF_OCR_SCALE ?? 1.7);
+    const scale = Number.isFinite(scaleRaw) && scaleRaw > 0 ? scaleRaw : 1.7;
+    const lang = String(process.env.PDF_OCR_LANG ?? 'rus+eng').trim() || 'rus+eng';
+    const recognize = await getTesseractRecognize();
+    if (!recognize)
+        return '';
+    const { createCanvas } = (await import('@napi-rs/canvas'));
+    const pdfjs = (await import('pdfjs-dist/legacy/build/pdf.mjs'));
+    const loadingTask = pdfjs.getDocument({
+        data: new Uint8Array(buffer),
+        disableWorker: true,
+        useSystemFonts: true,
+    });
+    const doc = await loadingTask.promise;
+    const pages = Math.min(Number(doc?.numPages ?? 0), maxPages);
+    const chunks = [];
+    for (let pageNum = 1; pageNum <= pages; pageNum++) {
+        try {
+            const page = await doc.getPage(pageNum);
+            const viewport = page.getViewport({ scale });
+            const width = Math.max(1, Math.ceil(Number(viewport.width)));
+            const height = Math.max(1, Math.ceil(Number(viewport.height)));
+            const canvas = createCanvas(width, height);
+            const context = canvas.getContext('2d');
+            await page.render({ canvasContext: context, viewport }).promise;
+            const img = canvas.toBuffer('image/png');
+            const result = await withTimeout(recognize(img, lang, {
+                logger: () => undefined,
+            }), timeoutMs);
+            const text = normalizeText(String(result?.data?.text ?? ''));
+            if (text.length >= minTextLength)
+                chunks.push(text);
+        }
+        catch {
+            // Ignore OCR failures per page and continue.
+        }
+    }
+    try {
+        await doc.destroy();
+    }
+    catch {
+        // Ignore cleanup errors.
+    }
+    return chunks.join('\n');
+}
 function extractRowsFromDocxWordXml(xml) {
     const out = [];
     const seen = new Set();
@@ -910,6 +1089,36 @@ function guessRowsFromText(text, maxRows = 2000) {
     }
     return rows;
 }
+function buildPdfFallbackRowsFromText(text) {
+    const out = [];
+    const seen = new Set();
+    const raw = (text ?? '').toString();
+    if (!raw)
+        return out;
+    const lines = raw
+        .split(/\n/g)
+        .map((line) => line.replace(/\s+/g, ' ').trim())
+        .filter((line) => line.length >= 24 && /[a-zа-яё]/i.test(line))
+        .slice(0, 40);
+    if (lines.length === 0)
+        return out;
+    const description = lines.join(' ').slice(0, 4000).trim();
+    if (description.length >= 24) {
+        pushParsedRowUnique(out, seen, {
+            indicator: 'Описание',
+            valueRaw: description,
+        });
+    }
+    // Keep one compact product-name hint when OCR/text extraction has it.
+    const productCandidate = lines.find((line) => couldBeProductNameValue(line) && line.length <= 220);
+    if (productCandidate) {
+        pushParsedRowUnique(out, seen, {
+            indicator: 'Наименование товара',
+            valueRaw: productCandidate,
+        });
+    }
+    return out;
+}
 export async function extractRowsFromFile(params) {
     const { buffer, filename } = params;
     const lower = filename.toLowerCase();
@@ -1002,8 +1211,6 @@ export async function extractRowsFromFile(params) {
         // Parse HTML table structure and merge indicator/value rows.
         const html = await mammoth.convertToHtml({ buffer });
         const fromHtml = extractRowsFromDocxHtmlTable(html.value ?? '');
-        if (fromHtml.length === 0)
-            return guessed;
         const merged = [];
         const seen = new Set();
         for (const r of guessed)
@@ -1026,7 +1233,16 @@ export async function extractRowsFromFile(params) {
         catch {
             // Ignore XML table fallback errors and keep extracted rows from mammoth.
         }
-        const allDocxText = `${result.value}\n${html.value ?? ''}\n${xmlText}`;
+        let ocrText = '';
+        try {
+            ocrText = await extractDocxImageOcrText(buffer);
+            for (const r of guessRowsFromText(ocrText))
+                pushParsedRowUnique(merged, seen, r);
+        }
+        catch {
+            // Ignore OCR errors and continue with textual extraction.
+        }
+        const allDocxText = `${result.value}\n${html.value ?? ''}\n${xmlText}\n${ocrText}`;
         for (const r of extractPresencePairsFromText(allDocxText))
             pushParsedRowUnique(merged, seen, r);
         // Second pass: extract "<parameter> + presence" pairs from already merged rows.
@@ -1101,12 +1317,73 @@ export async function extractRowsFromFile(params) {
         const parsed = await parser.getText();
         await parser.destroy();
         const text = normalizeText(parsed.text || '');
-        const guessed = guessRowsFromText(text);
+        let pdfOcrText = '';
+        try {
+            pdfOcrText = await extractPdfOcrText(buffer);
+        }
+        catch {
+            // Keep non-OCR flow if OCR fails.
+        }
+        const combinedText = pdfOcrText ? `${text}\n${pdfOcrText}` : text;
+        const guessed = guessRowsFromText(combinedText);
         const merged = [];
         const seen = new Set();
         for (const r of guessed)
             pushParsedRowUnique(merged, seen, r);
+        for (const r of extractPackQtyPairsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractProductNameRowsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractPurposeRowsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractMaterialRowsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractInfectionMarkerRowsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractDescriptionRowsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractLabelValueRowsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractColorScaleRowsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractAnalyticalSensitivityRowsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractNeedleGaugeRowsFromText(combinedText))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractMaterialRowsFromRows(merged))
+            pushParsedRowUnique(merged, seen, r);
+        if (merged.length === 0) {
+            for (const r of buildPdfFallbackRowsFromText(combinedText))
+                pushParsedRowUnique(merged, seen, r);
+        }
+        return merged;
+    }
+    if (lower.endsWith('.txt') ||
+        lower.endsWith('.csv') ||
+        lower.endsWith('.html') ||
+        lower.endsWith('.htm') ||
+        lower.endsWith('.json') ||
+        lower.endsWith('.xml')) {
+        const text = await extractTextFromFile({ buffer, filename });
+        const merged = [];
+        const seen = new Set();
+        for (const r of guessRowsFromText(text))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractPackQtyPairsFromText(text))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractProductNameRowsFromText(text))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractPurposeRowsFromText(text))
+            pushParsedRowUnique(merged, seen, r);
         for (const r of extractMaterialRowsFromText(text))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractInfectionMarkerRowsFromText(text))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractDescriptionRowsFromText(text))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractLabelValueRowsFromText(text))
+            pushParsedRowUnique(merged, seen, r);
+        for (const r of extractColorScaleRowsFromText(text))
             pushParsedRowUnique(merged, seen, r);
         for (const r of extractAnalyticalSensitivityRowsFromText(text))
             pushParsedRowUnique(merged, seen, r);
@@ -1114,6 +1391,12 @@ export async function extractRowsFromFile(params) {
             pushParsedRowUnique(merged, seen, r);
         for (const r of extractMaterialRowsFromRows(merged))
             pushParsedRowUnique(merged, seen, r);
+        if (merged.length === 0 && text.trim().length > 0) {
+            pushParsedRowUnique(merged, seen, {
+                indicator: 'Описание',
+                valueRaw: text.slice(0, 2000),
+            });
+        }
         return merged;
     }
     throw new Error(`Unsupported file type: ${filename}`);

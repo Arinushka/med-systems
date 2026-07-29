@@ -577,6 +577,27 @@ body {
   font-size: 13px;
 }
 
+.ms-inline-feedback {
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.ms-folder-feedback {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #1f4aa2;
+  background: #eef4ff;
+  border: 1px solid #d8e5ff;
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.ms-folder-feedback--error {
+  color: var(--ms-bad);
+  background: var(--ms-bad-bg);
+  border-color: var(--ms-bad-border);
+}
+
 .ms-modal-overlay {
   position: fixed;
   inset: 0;

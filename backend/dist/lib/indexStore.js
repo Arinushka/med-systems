@@ -20,6 +20,8 @@ export async function loadIndex() {
         const parsed = JSON.parse(raw);
         if (!parsed || !Array.isArray(parsed.docs))
             throw new Error('Invalid index');
+        if (!Array.isArray(parsed.folders))
+            parsed.folders = [];
         // Best-effort fix for filenames that were stored with mojibake encoding.
         // This affects display only; embeddings were computed from extracted content.
         for (const d of parsed.docs) {
@@ -42,6 +44,7 @@ export async function loadIndex() {
         return {
             version: 1,
             createdAt: new Date().toISOString(),
+            folders: [],
             docs: [],
         };
     }
