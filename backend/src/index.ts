@@ -15,7 +15,7 @@ import { centroid } from './lib/centroid.js'
 import { cosineSimilarity } from './utils/cosine.js'
 import { extractRowsFromFile } from './lib/rows.js'
 import { extractTextFromFile } from './lib/extract.js'
-import { loadIndex, saveIndex, type LibraryDoc } from './lib/indexStore.js'
+import { loadIndex, saveIndex, type LibraryDoc, type LibraryFolder } from './lib/indexStore.js'
 import { valuesMatch } from './lib/valueCompare.js'
 import { compareProductNamesWithOllama, judgeMatch, type RowForJudge, type JudgeDecision } from './lib/judge.js'
 import {
@@ -2260,6 +2260,13 @@ function libraryContentHash(buffer: Buffer): string {
   return crypto.createHash('sha256').update(buffer).digest('hex')
 }
 
+function sanitizeFolderName(value: unknown): string {
+  return String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120)
+}
+
 async function findLibraryDuplicate(params: {
   docs: LibraryDoc[]
   buffer: Buffer
@@ -2862,6 +2869,7 @@ app.post('/api/library/add', upload.single('file'), async (req, res) => {
         originalFilename: fixedFilename,
         extension,
         storedPath,
+        folderId: null,
         contentHash: libraryContentHash(f.buffer),
         normalizedTextHash,
         extractedText,
@@ -2909,11 +2917,13 @@ app.get('/api/library/list', async (_req, res) => {
     const index = await loadIndex()
     res.json({
       ok: true,
+      folders: Array.isArray(index.folders) ? index.folders : [],
       docs: index.docs.map((d) => ({
         id: d.id,
         originalFilename: d.originalFilename,
         extension: d.extension,
         storedPath: d.storedPath,
+        folderId: d.folderId ?? null,
         contentHash: d.contentHash ?? null,
         normalizedTextHash: d.normalizedTextHash ?? null,
         embeddingModel: d.embeddingModel ?? null,
@@ -2922,6 +2932,64 @@ app.get('/api/library/list', async (_req, res) => {
         indexedAt: d.indexedAt,
       })),
     })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    res.status(500).json({ error: message })
+  }
+})
+
+app.post('/api/library/folders', async (req, res) => {
+  try {
+    const name = sanitizeFolderName(req.body?.name)
+    if (!name) return res.status(400).json({ error: 'Folder name is required' })
+
+    const folder = await withLibraryIndexLock(async () => {
+      const index = await loadIndex()
+      const folders = Array.isArray(index.folders) ? index.folders : []
+      const duplicate = folders.find((f) => f.name.toLowerCase() === name.toLowerCase())
+      if (duplicate) return duplicate
+      const created: LibraryFolder = {
+        id: crypto.randomUUID(),
+        name,
+        createdAt: new Date().toISOString(),
+      }
+      index.folders = [...folders, created]
+      await saveIndex(index)
+      return created
+    })
+
+    res.json({ ok: true, folder })
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    res.status(500).json({ error: message })
+  }
+})
+
+app.post('/api/library/move', async (req, res) => {
+  try {
+    const docId = String(req.body?.docId ?? '').trim()
+    const folderIdRaw = req.body?.folderId
+    const folderId = folderIdRaw == null || String(folderIdRaw).trim() === '' ? null : String(folderIdRaw).trim()
+    if (!docId) return res.status(400).json({ error: 'docId is required' })
+
+    const moved = await withLibraryIndexLock(async () => {
+      const index = await loadIndex()
+      const doc = index.docs.find((d) => d.id === docId)
+      if (!doc) return { ok: false as const, error: 'Document not found' }
+
+      if (folderId) {
+        const folders = Array.isArray(index.folders) ? index.folders : []
+        const exists = folders.some((f) => f.id === folderId)
+        if (!exists) return { ok: false as const, error: 'Folder not found' }
+      }
+
+      doc.folderId = folderId
+      await saveIndex(index)
+      return { ok: true as const, doc }
+    })
+
+    if (!moved.ok) return res.status(404).json({ error: moved.error })
+    res.json({ ok: true, doc: moved.doc })
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     res.status(500).json({ error: message })
@@ -3015,6 +3083,7 @@ app.post('/api/library/reindexStored', async (_req, res) => {
           originalFilename: fixedFilename,
           extension,
           storedPath,
+          folderId: null,
           contentHash: libraryContentHash(buffer),
           normalizedTextHash,
           extractedText,

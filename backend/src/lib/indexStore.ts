@@ -20,6 +20,7 @@ export type LibraryDoc = {
   originalFilename: string
   extension: string
   storedPath: string
+  folderId?: string | null
   contentHash?: string
   normalizedTextHash?: string
   extractedText?: string
@@ -33,9 +34,16 @@ export type LibraryDoc = {
   indexedAt: string
 }
 
+export type LibraryFolder = {
+  id: string
+  name: string
+  createdAt: string
+}
+
 export type LibraryIndex = {
   version: 1
   createdAt: string
+  folders?: LibraryFolder[]
   docs: LibraryDoc[]
 }
 
@@ -51,6 +59,7 @@ export async function loadIndex(): Promise<LibraryIndex> {
     const raw = await fs.readFile(INDEX_PATH, 'utf-8')
     const parsed = JSON.parse(raw) as LibraryIndex
     if (!parsed || !Array.isArray(parsed.docs)) throw new Error('Invalid index')
+    if (!Array.isArray(parsed.folders)) parsed.folders = []
 
     // Best-effort fix for filenames that were stored with mojibake encoding.
     // This affects display only; embeddings were computed from extracted content.
@@ -74,6 +83,7 @@ export async function loadIndex(): Promise<LibraryIndex> {
     return {
       version: 1,
       createdAt: new Date().toISOString(),
+      folders: [],
       docs: [],
     }
   }
