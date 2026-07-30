@@ -11,6 +11,7 @@ import {
   indicatorLooksLikeProductNameColumn,
   looksLikeAuxValueForFirstColumnProduct,
 } from './productName.js'
+import { extractDiseaseMarkerLabelsFromText } from './diseaseMarkers.js'
 
 export type ParsedRow = {
   indicator: string
@@ -237,25 +238,12 @@ function extractMaterialRowsFromText(text: string): ParsedRow[] {
   return out
 }
 
-function extractInfectionMarkerRowsFromText(text: string): ParsedRow[] {
+export function extractInfectionMarkerRowsFromText(text: string): ParsedRow[] {
   const out: ParsedRow[] = []
   const seen = new Set<string>()
   const raw = (text ?? '').toString()
   if (!raw) return out
-  const n = normalizeText(raw).toLowerCase()
-
-  const hasHepB = /(?:гепатит[а-яё\s]*в|hbsag|hbv)/i.test(n)
-  const hasHepC = /(?:гепатит[а-яё\s]*с|hcv)/i.test(n)
-  const hasHiv1 = /(?:вич[\s\-_/]*1|hiv[\s\-_/]*1|вич[\s\-_/]*1[\s,.;:/-]*2|hiv[\s\-_/]*1[\s,.;:/-]*2)/i.test(n)
-  const hasHiv2 = /(?:вич[\s\-_/]*2|hiv[\s\-_/]*2|вич[\s\-_/]*1[\s,.;:/-]*2|hiv[\s\-_/]*1[\s,.;:/-]*2)/i.test(n)
-  const hasSyph = /(?:сифил|treponema\s*pallidum|tp\b)/i.test(n)
-
-  const markers: string[] = []
-  if (hasHepB) markers.push('гепатит B')
-  if (hasHepC) markers.push('гепатит C')
-  if (hasHiv1) markers.push('ВИЧ 1')
-  if (hasHiv2) markers.push('ВИЧ 2')
-  if (hasSyph) markers.push('сифилис')
+  const markers = extractDiseaseMarkerLabelsFromText(raw)
 
   if (markers.length >= 2) {
     pushParsedRowUnique(out, seen, {
@@ -1379,4 +1367,3 @@ export async function extractRowsFromFile(params: { buffer: Buffer; filename: st
 
   throw new Error(`Unsupported file type: ${filename}`)
 }
-

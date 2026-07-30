@@ -16,15 +16,19 @@ import { cosineSimilarity } from './utils/cosine.js'
 import { extractRowsFromFile } from './lib/rows.js'
 import { extractTextFromFile } from './lib/extract.js'
 import { loadIndex, saveIndex, type LibraryDoc, type LibraryFolder } from './lib/indexStore.js'
-import { valuesMatch } from './lib/valueCompare.js'
 import { compareProductNamesWithOllama, judgeMatch, type RowForJudge, type JudgeDecision } from './lib/judge.js'
 import {
-  compositionLongTextFallbackMatch,
+  calculateCappedMatchSummary,
   isExcludedFromParameterMatch,
+  matchKeyValueRowPair,
+  prepareKeyValueCriteria,
   scoreKeyValueIndicators,
-  tenderAliasesAllowValueCompare,
 } from './lib/keyValueScoring.js'
 import { extractNormalizedProductNamesFromRows } from './lib/productName.js'
+import {
+  extractDiseaseMarkersFromRows,
+  extractDiseaseMarkersFromText,
+} from './lib/diseaseMarkers.js'
 import { createMatchingRuntime } from './matching/factory.js'
 
 const app = express()
@@ -2088,34 +2092,6 @@ function extractProductCodesFromRows(rows: Array<{ indicator: string; valueRaw: 
   return [...out]
 }
 
-function extractDiseaseMarkersFromText(text: string): string[] {
-  const s = (text ?? '').toString().toLowerCase()
-  const out = new Set<string>()
-  if (/(treponema|сифил)/i.test(s)) out.add('treponema')
-  if (/(вич|hiv)/i.test(s)) out.add('hiv')
-  if (/(hbsag|hbv|гепатит\s*в)/i.test(s)) out.add('hbv')
-  if (/(hcv|гепатит\s*с)/i.test(s)) out.add('hcv')
-  return [...out]
-}
-
-function extractDiseaseMarkersFromRows(rows: Array<{ indicator: string; valueRaw: string }>): string[] {
-  const out = new Set<string>()
-  for (const r of rows) {
-    for (const m of extractDiseaseMarkersFromText(`${r.indicator ?? ''} ${r.valueRaw ?? ''}`)) out.add(m)
-  }
-  return [...out]
-}
-
-function indicatorLooksComposition(indicator: string): boolean {
-  const s = (indicator ?? '').toLowerCase()
-  return s.includes('состав') || s.includes('комплектац') || s.includes('описан')
-}
-
-function indicatorLooksPurposeOrDescription(indicator: string): boolean {
-  const s = (indicator ?? '').toLowerCase()
-  return s.includes('назначен') || s.includes('описан')
-}
-
 function detectAnalyzerInfoFromRows(
   rows: Array<{ indicator: string; valueRaw: string }>,
 ): { hasAnalyzer: boolean; analyzers: string[] } {
@@ -3256,6 +3232,7 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     const maxLibraryRows = autoMode
       ? Math.max(1, Number(process.env.AUTO_MATCH_KEYVALUE_MAX_LIBRARY_ROWS ?? 120))
       : Number(process.env.MATCH_KEYVALUE_MAX_LIBRARY_ROWS ?? 300)
+    const preparedQueryCriteria = prepareKeyValueCriteria(queryRows as any[], maxKeyRows)
 
     // Row-based decision; global centroid ranking is not used currently.
 
@@ -3342,8 +3319,8 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         const queryMarkerSet = new Set(queryMarkers)
         const codeMatch = (codes ?? []).some((c: string) => queryCodeSet.has(c))
         const markerArr = Array.isArray(markers) ? markers : []
-        const markerInter = markerArr.filter((m: string) => queryMarkerSet.has(m)).length
-        const markerExtra = markerArr.filter((m: string) => !queryMarkerSet.has(m)).length
+        const markerInter = markerArr.filter((m) => queryMarkerSet.has(m)).length
+        const markerExtra = markerArr.filter((m) => !queryMarkerSet.has(m)).length
         const markerRecall = queryMarkerSet.size > 0 ? markerInter / queryMarkerSet.size : 0
         const markerPrecision = markerArr.length > 0 ? markerInter / markerArr.length : 0
         const markerMatch = markerInter > 0 && queryMarkerSet.size > 0
@@ -3570,13 +3547,12 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
     )
 
     // 1) Hybrid coarse ranking (docEmbedding + lexical recall over keywords).
-    const queryVectors = queryRows
-      .filter((r) => !isExcludedFromParameterMatch(r.indicator))
+    const queryVectors = preparedQueryCriteria
       .map((r) => r.embedding)
       .filter((v) => Array.isArray(v)) as number[][]
     const queryDocEmbedding = queryVectors.length > 0 ? centroid(queryVectors) : null
     const queryKeywordTokens = toKeywordTokenSet([
-      ...queryRows.map((r) => String(r.indicator ?? '')),
+      ...preparedQueryCriteria.map((r) => String(r.indicator ?? '')),
       ...queryNamesForGate,
       ...queryCodes,
       ...queryMarkers,
@@ -3676,12 +3652,11 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         const valueToleranceAbs = Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0)
 
         const prop = scoreKeyValueIndicators({
-          queryRows: queryRows as any,
+          queryRows: preparedQueryCriteria as any,
           libraryRows: reducedLibRowsWithEmb as any,
           indicatorSimilarityThreshold,
           valueToleranceRel,
           valueToleranceAbs,
-          maxKeyRows,
         })
 
         const score = prop.totalPossible > 0 ? prop.points / prop.totalPossible : 0
@@ -3728,87 +3703,46 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
         (r: any) => Array.isArray(r.embedding) && !isExcludedFromParameterMatch(r.indicator),
       )
       if (libRowsWithEmb.length === 0) return []
-      const queryRowsForResults = (queryRows as any[]).filter((r) => !isExcludedFromParameterMatch(r.indicator))
+      const queryRowsForResults = preparedQueryCriteria as any[]
 
       const rows = queryRowsForResults
         .map((qRow) => {
-          const qEmb = qRow.embedding as number[]
-          let bestSimAll = -Infinity
-          let bestLibAll: any = null
-          let bestSimValueMatch = -Infinity
-          let bestLibValueMatch: any = null
+          let bestPair: { libraryRow: any; result: ReturnType<typeof matchKeyValueRowPair> } | null = null
+          let bestMatchedPair: { libraryRow: any; result: ReturnType<typeof matchKeyValueRowPair> } | null = null
 
           for (const lRow of libRowsWithEmb as any[]) {
-            const s = cosineSimilarity(qEmb, lRow.embedding as number[])
-            if (s > bestSimAll) {
-              bestSimAll = s
-              bestLibAll = lRow
-            }
-
-            const aliasPair = tenderAliasesAllowValueCompare(qRow.indicator, lRow.indicator)
-            const keywordSimilar = false
-            if (s < indicatorSimilarityThreshold && !aliasPair && !keywordSimilar) continue
-
-            const m = valuesMatch({
-              queryValueRaw: qRow.valueRaw,
-              libraryValueRaw: lRow.valueRaw,
-              toleranceRel: Number(process.env.MATCH_VALUE_TOLERANCE_REL ?? 0.1),
-              toleranceAbs: Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0),
+            const result = matchKeyValueRowPair({
+              queryRow: qRow,
+              libraryRow: lRow,
+              indicatorSimilarityThreshold,
+              valueToleranceRel: Number(process.env.MATCH_VALUE_TOLERANCE_REL ?? 0.1),
+              valueToleranceAbs: Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0),
             })
-            const fallbackTextMatch =
-              aliasPair &&
-              ((
-                indicatorLooksComposition(qRow.indicator) &&
-                indicatorLooksComposition(lRow.indicator)
-              ) ||
-                (indicatorLooksPurposeOrDescription(qRow.indicator) &&
-                  indicatorLooksPurposeOrDescription(lRow.indicator))) &&
-              compositionLongTextFallbackMatch(qRow.valueRaw, lRow.valueRaw)
-
-            if ((m.match || fallbackTextMatch) && s > bestSimValueMatch) {
-              bestSimValueMatch = s
-              bestLibValueMatch = lRow
+            if (!bestPair || result.indicatorSimilarity > bestPair.result.indicatorSimilarity) {
+              bestPair = { libraryRow: lRow, result }
+            }
+            if (
+              result.rowMatched &&
+              (!bestMatchedPair || result.indicatorSimilarity > bestMatchedPair.result.indicatorSimilarity)
+            ) {
+              bestMatchedPair = { libraryRow: lRow, result }
             }
           }
 
-          const chosenLib = bestLibValueMatch ?? bestLibAll
-          const m = chosenLib
-            ? valuesMatch({
-                queryValueRaw: qRow.valueRaw,
-                libraryValueRaw: chosenLib.valueRaw,
-                toleranceRel: Number(process.env.MATCH_VALUE_TOLERANCE_REL ?? 0.1),
-                toleranceAbs: Number(process.env.MATCH_VALUE_TOLERANCE_ABS ?? 0),
-              })
-            : { match: false, reason: 'no candidate' }
-          const fallbackTextMatch =
-            chosenLib != null &&
-            tenderAliasesAllowValueCompare(qRow.indicator, chosenLib.indicator) &&
-            ((
-              indicatorLooksComposition(qRow.indicator) &&
-              indicatorLooksComposition(chosenLib.indicator)
-            ) ||
-              (indicatorLooksPurposeOrDescription(qRow.indicator) &&
-                indicatorLooksPurposeOrDescription(chosenLib.indicator))) &&
-            compositionLongTextFallbackMatch(qRow.valueRaw, chosenLib.valueRaw)
-
-          const bestSimForIndicatorOk = chosenLib === bestLibValueMatch ? bestSimValueMatch : bestSimAll
-          const keywordSimilar = false
-          const indicatorOk =
-            bestSimForIndicatorOk >= indicatorSimilarityThreshold ||
-            (chosenLib != null &&
-              (tenderAliasesAllowValueCompare(qRow.indicator, chosenLib.indicator) || keywordSimilar))
-          const valueOk = Boolean(m.match || fallbackTextMatch)
+          const chosenPair = bestMatchedPair ?? bestPair
+          const chosenLib = chosenPair?.libraryRow
+          const matchResult = chosenPair?.result
 
           return {
             indicator: qRow.indicator,
             queryValueRaw: qRow.valueRaw,
             matchedLibraryIndicator: chosenLib?.indicator,
             matchedLibraryValueRaw: chosenLib?.valueRaw,
-            indicatorSimilarity: bestSimForIndicatorOk,
-            valueMatch: valueOk,
-            indicatorOk,
-            valueReason: m.match ? m.reason : fallbackTextMatch ? 'composition long-text fallback' : m.reason,
-            rowMatched: indicatorOk && valueOk,
+            indicatorSimilarity: matchResult?.indicatorSimilarity ?? -Infinity,
+            valueMatch: matchResult?.valueMatch ?? false,
+            indicatorOk: matchResult?.indicatorOk ?? false,
+            valueReason: matchResult?.valueReason ?? 'no candidate',
+            rowMatched: matchResult?.rowMatched ?? false,
           }
         })
         .filter((r) => Boolean(r.rowMatched))
@@ -3989,9 +3923,13 @@ app.post('/api/match', upload.single('file'), async (req, res) => {
       : buildMatchedRowResultsForDoc(selected.doc)
 
     const matchedCountByRows = rowResults.length
-    const matchedCountOut = Math.max(selected.matchedCount, matchedCountByRows)
-    const rawMatchPercentOut =
-      selected.totalCount > 0 ? (matchedCountOut / selected.totalCount) * 100 : 0
+    const matchSummary = calculateCappedMatchSummary({
+      scoredMatchedCount: selected.matchedCount,
+      refinedMatchedCount: matchedCountByRows,
+      totalCount: selected.totalCount,
+    })
+    const matchedCountOut = matchSummary.matchedCount
+    const rawMatchPercentOut = matchSummary.matchPercent
     const minMatchPercentForComplianceDefault = Number(process.env.MATCH_MIN_PERCENT_FOR_COMPLIANCE ?? 30)
     const minMatchPercentForCompliance = clampPercent(
       minMatchPercentForComplianceByRequest ?? minMatchPercentForComplianceDefault,
@@ -4707,4 +4645,3 @@ app.listen(port, () => {
     }
   })()
 })
-

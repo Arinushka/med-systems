@@ -43,6 +43,40 @@ function looksNumericOnly(valueRaw: string): boolean {
   return /^[\d.,\s/+-]+$/.test(v)
 }
 
+const PRODUCT_NAME_HEADER_ONLY_VALUES = new Set([
+  'характеристики товара',
+  'кол во товара',
+  'количество товара',
+  'примечание',
+  'наименование характеристики',
+  'инструкция по заполнению характеристик в заявке',
+  'обоснование дополнительных характеристик',
+  'окпд2 код позиции ктру',
+  'наименование товара',
+  'наименование изделия',
+  'при необходимости',
+])
+
+function looksLikeAnnotatedProductTableHeader(normalizedValue: string): boolean {
+  if (
+    /^(?:кол во|количество) товара(?:\s+(?:шт|штук|ед|единица|единицы|упаковка|упаковок|наборов))*$/.test(
+      normalizedValue,
+    )
+  ) {
+    return true
+  }
+
+  if (
+    /^наименование (?:товара|изделия) (?:характеристика|характеристики|описание)(?:\s+(?:заполняется|указывается|указать|для заполнения)(?:\s.*)?)?$/.test(
+      normalizedValue,
+    )
+  ) {
+    return true
+  }
+
+  return /^примечание\s+(?:заполняется|указывается|указать|для заполнения)(?:\s|$)/.test(normalizedValue)
+}
+
 /**
  * Rejects unit labels and table headers that DOCX text extraction often places
  * right after "Наименование товара" instead of the real product title.
@@ -53,6 +87,9 @@ export function couldBeProductNameValue(valueRaw: string): boolean {
   const n = normalizeText(v)
   if (n.length < 3) return false
   if (/^[0-9]+([.,][0-9]+)?$/.test(n)) return false
+
+  if (PRODUCT_NAME_HEADER_ONLY_VALUES.has(n)) return false
+  if (looksLikeAnnotatedProductTableHeader(n)) return false
 
   const bannedPhrases = [
     'ед изм',
@@ -117,6 +154,16 @@ export function couldBeProductNameValue(valueRaw: string): boolean {
   }
 
   return true
+}
+
+function looksLikeProductCodeIndicator(indicatorRaw: string): boolean {
+  return /^\d{2}(?:\.\d{2}){2}\.\d{3}(?:-\d+)?$/.test((indicatorRaw ?? '').toString().trim())
+}
+
+function looksLikeProductText(valueRaw: string): boolean {
+  const n = normalizeText(valueRaw)
+  if (n.length < 8) return false
+  return /(ивд|тест|наркот|реагент|издел|анализатор|кассет|полоск|панел|контейнер)/.test(n)
 }
 
 function extractNameCandidates(raw: string): string[] {
@@ -230,6 +277,22 @@ export function extractNormalizedProductNamesFromRows(
 
   if (out.length > 0) return out
 
+  // Some tables pair an OKPD2 code in the first column with the actual product
+  // title in the second one, after a block of repeated column headers.
+  for (const r of rows.slice(0, 80)) {
+    const indicatorRaw = (r.indicator ?? '').toString()
+    const valueRaw = (r.valueRaw ?? '').toString()
+    if (!looksLikeProductCodeIndicator(indicatorRaw) || !looksLikeProductText(valueRaw)) continue
+
+    const candidate = normalizeText(valueRaw)
+    if (!seen.has(candidate)) {
+      seen.add(candidate)
+      out.push(candidate)
+    }
+  }
+
+  if (out.length > 0) return out
+
   // Fallback: first-column templates (product title in "indicator", service value in second column).
   for (const r of rows.slice(0, 40)) {
     const indicatorRaw = (r.indicator ?? '').toString()
@@ -310,4 +373,3 @@ export function extractProductNameFromRows(rows: Array<{ indicator: string; valu
   if (names.length === 0) return null
   return names.reduce((best, n) => (n.length >= best.length ? n : best))
 }
-
